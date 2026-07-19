@@ -1,0 +1,14 @@
+.env
+.venv/
+venv/
+test/
+__pycache__/
+*.pyc
+logs/
+fox_bot_data/
+*.tmp
+ssh_run.py
+sh.exe.stackdump
+request.json
+plan
+*.md

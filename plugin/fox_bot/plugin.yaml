@@ -1,0 +1,305 @@
+# QQ 平台插件(Hermes gateway platform adapter)
+#
+# 部署: 本目录软链/拷贝到 ~/.hermes/plugins/fox_bot/,变量填入 ~/.hermes/.env,
+#       hermes gateway run 即加载。
+# 格式已按官方文档校准(developer-guide/adding-platform-adapters):
+# requires_env/optional_env 自动进入 hermes config UI。
+name: fox_bot
+label: QQ
+kind: platform
+version: 0.2.0
+description: >
+  QQ group/private bridge via NapCat (OneBot v11 reverse WebSocket).
+  Trigger channels (@/keyword/probability/timer), heat model, context queue
+  injection, T1/T2 pacing, tool-only outbound protocol.
+author: FoxBot2Hermes
+
+requires_env:
+  - name: FOX_QQ_BOT_QQ
+    description: "机器人自己的 QQ 号"
+    prompt: "Bot QQ number"
+    password: false
+  - name: FOX_QQ_BOT_ALLOWED_GROUPS
+    description: "群白名单,逗号分隔的群号"
+    prompt: "Allowed group IDs (comma-separated)"
+    password: false
+  - name: FOX_QQ_BOT_ADMIN_QQ
+    description: "管理员 QQ 号,逗号分隔(斜杠命令权限)"
+    prompt: "Admin QQ numbers (comma-separated)"
+    password: false
+
+optional_env:
+  - name: FOX_QQ_BOT_NAPCAT_WS_PORT
+    description: "OneBot v11 WS 服务端监听端口,NapCat 反向连入(默认 18197)"
+    prompt: "NapCat WS port"
+    password: false
+  - name: FOX_QQ_BOT_NAPCAT_WS_TOKEN
+    description: "接入鉴权 token,对应 NapCat websocketClient 的 token;非空时校验握手 Authorization,留空=不校验"
+    prompt: "NapCat WS access token"
+    password: true
+  - name: FOX_QQ_BOT_ALLOWED_PRIVATE
+    description: "私聊白名单 QQ 号,逗号分隔(空=关闭私聊)"
+    prompt: "Allowed private QQ numbers"
+    password: false
+  - name: FOX_QQ_BOT_GROUP_ALLOW_ALL_GROUP_USERS
+    description: "是否放行群内所有成员触发(默认 true)。设 false 后仅名单内成员+管理员的消息参与触发"
+    password: false
+  - name: FOX_QQ_BOT_GROUP_ALLOWED_USERS
+    description: "仅当 FOX_QQ_BOT_GROUP_ALLOW_ALL_GROUP_USERS=false 时生效: 允许触发机器人的群成员 QQ 号名单(逗号分隔)"
+    password: false
+  - name: FOX_QQ_BOT_NAMES
+    description: "纯文本 @别名,逗号分隔(手打 @ 不产生 at 段时的兜底判定)"
+    prompt: "Bot name aliases"
+    password: false
+  - name: FOX_QQ_BOT_GROUP_KEYWORDS
+    description: '关键词触发字典 JSON,如 {"酒狐": 0.8, "机器人": 0.3}'
+    prompt: "Keyword triggers (JSON)"
+    password: false
+  - name: FOX_QQ_BOT_INJECT_PROMPT
+    description: "运行时注入到各提示词模版开头 {{INJECT}} 的内容"
+    password: false
+  - name: FOX_QQ_BOT_TIMEZONE
+    description: "提示词 {{TIME}} 注入时间的时区(IANA 名,默认 Asia/Shanghai);非法则回退系统本地时间"
+    prompt: "Timezone (IANA name)"
+    password: false
+  - name: FOX_QQ_BOT_TIME_FORMAT
+    description: "注入时间的 strftime 格式,默认 %Y-%m-%d %H:%M:%S %A(含星期)"
+    password: false
+  - name: FOX_QQ_BOT_GROUP_CTX_K
+    description: "上下文队列长度 K(默认 50)"
+    password: false
+  - name: FOX_QQ_BOT_TRIGGER_QUEUE
+    description: "待处理触发队列长度(默认 3)"
+    password: false
+  - name: FOX_QQ_BOT_PROCESS_DELAY
+    description: "对话处理延迟 T1 秒(默认 6)"
+    password: false
+  - name: FOX_QQ_BOT_BURST_DELAY
+    description: "连续对话推迟延迟 T2 秒(默认 2)"
+    password: false
+  - name: FOX_QQ_BOT_USER_COOLDOWN
+    description: "个人冷却秒(默认 1)"
+    password: false
+  - name: FOX_QQ_BOT_GROUP_SHARED_COOLDOWN
+    description: "群共享冷却秒,压制概率触发(默认 0=关闭)"
+    password: false
+  - name: FOX_QQ_BOT_GROUP_HEAT_WINDOW
+    description: "瞬时热度统计窗口秒(默认 60)"
+    password: false
+  - name: FOX_QQ_BOT_GROUP_PROB_QUADRATIC
+    description: "概率曲线二次增长(默认 false=线性)"
+    password: false
+  - name: FOX_QQ_BOT_GROUP_HEAT_ACCUMULATE
+    description: "累计热度模式(默认 false=瞬时速率)"
+    password: false
+  - name: FOX_QQ_BOT_GROUP_HEAT_ACC_RATIO
+    description: "累计系数(默认 0.2)"
+    password: false
+  - name: FOX_QQ_BOT_GROUP_HEAT_MAX
+    description: "累计值 C 上限(默认 100;<=0 不设限)"
+    password: false
+  - name: FOX_QQ_BOT_GROUP_HEAT_DECAY_IDLE
+    description: "空闲多少秒后 C 开始衰减(默认 40)"
+    password: false
+  - name: FOX_QQ_BOT_GROUP_HEAT_DECAY_FACTOR
+    description: "C 每秒保留比例(默认 0.95)"
+    password: false
+  - name: FOX_QQ_BOT_GROUP_TIMER_INTERVAL
+    description: "定时判定间隔秒(默认 20);<=0 完全关闭定时渠道"
+    password: false
+  - name: FOX_QQ_BOT_CRON_TASKS
+    description: '定时任务 JSON 列表(默认空),每项 {"name","schedule"(5 字段 cron),"prompt","target"("group:群号"/"private:QQ号")};不合格项不启动并警告'
+    password: false
+  - name: FOX_QQ_BOT_CRON_PROMPT_PATH
+    description: "定时任务提示词模版路径(默认插件内 prompts/cron.txt,占位符 {{CronBody}})"
+    password: false
+  - name: FOX_QQ_BOT_GROUP_TK_STEP_MENTIONED
+    description: "临时热度: 被@一次增加的 TK(默认 100,按次计与人数无关)"
+    password: false
+  - name: FOX_QQ_BOT_GROUP_TK_STEP_AT_OTHERS
+    description: "临时热度: 主动@别人/引用别人一次增加的 TK(默认 50)"
+    password: false
+  - name: FOX_QQ_BOT_GROUP_TK_MAX
+    description: "临时热度 TK 上限(默认 200)"
+    password: false
+  - name: FOX_QQ_BOT_GROUP_TK_SETTLE_INTERVAL
+    description: "TK 衰减结算频率秒(默认 10,<=0 关闭衰减循环)"
+    password: false
+  - name: FOX_QQ_BOT_GROUP_TK_DECAY_PROPORTIONAL
+    description: "TK 衰减方式: false=固定值(默认) / true=比例"
+    password: false
+  - name: FOX_QQ_BOT_GROUP_TK_DECAY_FIXED
+    description: "TK 固定衰减每次减去的值(默认 10)"
+    password: false
+  - name: FOX_QQ_BOT_GROUP_TK_DECAY_RATIO
+    description: "TK 比例衰减每次乘以的比例(默认 0.75)"
+    password: false
+  - name: FOX_QQ_BOT_GROUP_TK_MSG_MULT
+    description: "TK 对每条消息渠道概率的乘数(默认 0.1,0=无影响)"
+    password: false
+  - name: FOX_QQ_BOT_GROUP_TK_TIMER_MULT
+    description: "TK 对定时渠道概率的乘数(默认 1.0,0=无影响)"
+    password: false
+  - name: FOX_QQ_BOT_GROUP_CUT_LINE
+    description: "比例衰减共享归零阈值(TK 与累计热度 C 共用,默认 0.1)"
+    password: false
+  - name: FOX_QQ_BOT_GROUP_TIMER_PROB_LO
+    description: "定时触发概率曲线 LO(默认 2)"
+    password: false
+  - name: FOX_QQ_BOT_GROUP_TIMER_PROB_HI
+    description: "定时触发概率曲线 HI(默认 20)"
+    password: false
+  - name: FOX_QQ_BOT_GROUP_TIMER_PROB_CAP
+    description: "定时触发概率封顶(默认 1.0)"
+    password: false
+  - name: FOX_QQ_BOT_GROUP_TIMER_PROB_THRESHOLD
+    description: "定时触发概率起跳值(默认 0.1): rate 刚超过 LO 时的最低概率,然后继续增长到 CAP"
+    password: false
+  - name: FOX_QQ_BOT_GROUP_TIMER_PROB_CURVE
+    description: "定时触发概率曲线类型: linear(默认) / quadratic / sqrt / cubic / cbrt"
+    password: false
+  - name: FOX_QQ_BOT_GROUP_MSG_PROB_LO
+    description: "消息触发概率曲线 LO(默认 5)"
+    password: false
+  - name: FOX_QQ_BOT_GROUP_MSG_PROB_HI
+    description: "消息触发概率曲线 HI(默认 24)"
+    password: false
+  - name: FOX_QQ_BOT_GROUP_MSG_PROB_CAP
+    description: "消息触发概率封顶(默认 0.2)"
+    password: false
+  - name: FOX_QQ_BOT_GROUP_MSG_PROB_THRESHOLD
+    description: "消息触发概率起跳值(默认 0.05): rate 刚超过 LO 时的最低概率,然后继续增长到 CAP"
+    password: false
+  - name: FOX_QQ_BOT_GROUP_MSG_PROB_CURVE
+    description: "消息触发概率曲线类型: linear(默认) / quadratic / sqrt / cubic / cbrt"
+    password: false
+  - name: FOX_QQ_BOT_GROUP_RESOLVE_AT
+    description: "假@名字自动转真@总开关(默认 true): 按群名片→昵称→QQ号匹配群成员"
+    password: false
+  - name: FOX_QQ_BOT_GROUP_MEMBER_CACHE_TTL
+    description: "群成员列表缓存 TTL(秒,默认 1800): 供 @ 解析用,首次用时拉取+定时刷新"
+    password: false
+  - name: FOX_QQ_BOT_CHATTER_AUTOSEND
+    description: "双通道发言: 开启时 AI 正文(碎碎念)即时代发到当前会话,收尾只提醒补结束标记(默认 true);关闭则正文不代发,按旧纠正流程要求改用工具重发"
+    password: false
+  - name: FOX_QQ_BOT_PROTOCOL_RETRY
+    description: "收尾提醒/纠正重试上限(默认 3,上限 3)"
+    password: false
+  - name: FOX_QQ_BOT_GATEWAY_NOTICE_MARKERS
+    description: "gateway 系统通知识别串(JSON 字符串列表,命中即忽略,不算协议违规;默认含 home channel 引导/任务打断/进度心跳)"
+    password: false
+  - name: FOX_QQ_BOT_CONTINUE_THINK_MAX
+    description: "[CONTINUE_THINK] 续想次数上限(默认 100,<=0 不限;独立计数,每次成功续想重置纠正容错)"
+    password: false
+  - name: FOX_QQ_BOT_TURN_TIMEOUT
+    description: "回合超时兜底秒(默认 500)"
+    password: false
+  - name: FOX_QQ_BOT_TIMEOUT_TRACE_MAX_ITEMS
+    description: "超时通知回合轨迹最多保留条数(默认 12)"
+    password: false
+  - name: FOX_QQ_BOT_TIMEOUT_TRACE_MAX_CHARS
+    description: "超时通知回合轨迹字数上限(默认 1500,超过不输出;<=0 关闭)"
+    password: false
+  - name: FOX_QQ_BOT_STATE_FILE
+    description: "状态持久化文件(默认 ~/.hermes/fox_bot_data/groups.json)"
+    password: false
+  - name: FOX_QQ_BOT_STATE_SAVE_INTERVAL
+    description: "状态落盘间隔秒(默认 30;0=关闭)"
+    password: false
+  - name: FOX_QQ_BOT_MEDIA_ENABLE
+    description: "媒体桥接: 文件/图片转内部链接动态转发(默认 true)"
+    password: false
+  - name: FOX_QQ_BOT_MEDIA_PORT
+    description: "媒体桥接 HTTP 端口(默认 18198)"
+    password: false
+  - name: FOX_QQ_BOT_MEDIA_BIND
+    description: "媒体桥接监听地址(默认 0.0.0.0)"
+    password: false
+  - name: FOX_QQ_BOT_MEDIA_HOST
+    description: "注入链接使用的主机名/IP(默认 127.0.0.1,外部访问需改公网地址)"
+    password: false
+  - name: FOX_QQ_BOT_MEDIA_TTL
+    description: "媒体登记条目过期秒数(默认 86400,上限 24 小时)"
+    password: false
+  - name: FOX_QQ_BOT_MEDIA_MAX_MB
+    description: "媒体桥接文件大小上限 MB(默认 100,超过标记过大不可下载)"
+    password: false
+  - name: FOX_QQ_BOT_MEDIA_FILE
+    description: "媒体登记表持久化文件(默认 ~/.hermes/fox_bot_data/media.json)"
+    password: false
+  - name: FOX_QQ_BOT_GROUP_PROMPT_PATH
+    description: "群聊场景头模版路径(默认插件内 prompts/group.txt)"
+    password: false
+  - name: FOX_QQ_BOT_PRIVATE_PROMPT_PATH
+    description: "私聊场景头模版路径(默认插件内 prompts/private.txt)"
+    password: false
+  - name: FOX_QQ_BOT_PROACTIVE_PROMPT_PATH
+    description: "主动发言提示词路径(默认插件内 prompts/proactive.txt)"
+    password: false
+  - name: FOX_QQ_BOT_KEYWORD_PROMPT_PATH
+    description: "关键词触发提示词路径(默认插件内 prompts/keyword.txt)"
+    password: false
+  - name: FOX_QQ_BOT_WAKE_PROMPT_PATH
+    description: "唤醒提示词路径(默认插件内 prompts/wake.txt)"
+    password: false
+  - name: FOX_QQ_BOT_MAX_SEGMENT_LEN
+    description: "单条消息最大长度(默认 1800)"
+    password: false
+  - name: FOX_QQ_BOT_MAX_SEGMENTS
+    description: "最多分几条发送(默认 3)"
+    password: false
+  - name: FOX_QQ_BOT_IMAGE_URL_AS_IMAGE
+    description: "内容中图片 URL 自动转图片消息(默认 true)"
+    password: false
+  - name: FOX_QQ_BOT_LOG_FILE
+    description: "独立日志文件路径(留空=沿用 gateway 日志,不额外写文件)"
+    prompt: "QQ plugin log file (or empty)"
+    password: false
+  - name: FOX_QQ_BOT_LOG_LEVEL
+    description: "独立日志级别 INFO/DEBUG/WARNING(默认 INFO)"
+    password: false
+  - name: FOX_QQ_BOT_LOG_MAX_MB
+    description: "日志文件大小上限(MB,默认 10): 超过时砍掉前半保留后半续写; 0=不限"
+    password: false
+  - name: FOX_QQ_BOT_LOG_PROPAGATE
+    description: "写独立文件时是否仍向 gateway 主日志传播(默认 true)"
+    password: false
+  - name: FOX_QQ_BOT_DEBUG_HEAT
+    description: "热度变化调试日志"
+    password: false
+  - name: FOX_QQ_BOT_DEBUG_TRIGGER
+    description: "概率判定调试日志(含未触发)"
+    password: false
+  - name: FOX_QQ_BOT_DEBUG_CTX
+    description: "上下文队列调试日志(入队/注入长度)"
+    password: false
+  - name: FOX_QQ_BOT_DEBUG_TOOL
+    description: "工具调用解析调试日志(工具名/chat_id/参数键)"
+    password: false
+  - name: FOX_QQ_BOT_DEBUG_WS
+    description: "WebSocket 原始帧调试日志(收发完整 JSON,量大)"
+    password: false
+  - name: FOX_QQ_BOT_DEBUG_API
+    description: "OneBot API 调用调试日志(action/params/响应)"
+    password: false
+  - name: FOX_QQ_BOT_DEBUG_MEDIA
+    description: "媒体桥接调试日志(登记/拒绝)"
+    password: false
+  - name: FOX_QQ_BOT_DEBUG_PROMPT
+    description: "提示词注入全文调试日志(量大)"
+    password: false
+  - name: FOX_QQ_BOT_DEBUG_REPLY
+    description: "出站消息调试日志(分段/引用/表情)"
+    password: false
+  - name: FOX_QQ_BOT_DEBUG_EMOTICON
+    description: "表情解析调试日志(命中/回退/模糊匹配)"
+    password: false
+  - name: FOX_QQ_BOT_ERROR_NOTIFY_ADMIN
+    description: "运行时错误私聊通知所有管理员(默认 true)"
+    password: false
+  - name: FOX_QQ_BOT_ERROR_NOTIFY_GROUP
+    description: "运行时错误在出错的群里通知(默认 false)"
+    password: false
+  - name: FOX_QQ_BOT_ERROR_NOTIFY_COOLDOWN
+    description: "同类错误通知冷却(秒,默认 60)"
+    password: false

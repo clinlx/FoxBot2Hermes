@@ -1,0 +1,2 @@
+# FoxBot2Hermes 插件依赖(Hermes gateway 运行环境通常已自带)
+websockets>=12.0
