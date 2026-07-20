@@ -53,6 +53,42 @@ optional_env:
   - name: FOX_QQ_BOT_FRIEND_PROMPT_PATH
     description: "新好友问候提示词模版路径(默认插件内 prompts/friend.txt,{{Comment}} 为对方验证消息)"
     password: false
+  - name: FOX_QQ_BOT_IMAGE_OPENAI_API_KEY
+    description: "生图方案 openai(GPT-image 系列)的 API Key;默认空=该方案关闭。任一生图方案启用才注册 fox_qq_gen_image 工具"
+    password: true
+  - name: FOX_QQ_BOT_IMAGE_OPENAI_BASE_URL
+    description: "openai 方案接口地址(默认 https://api.openai.com/v1,中转商可改)"
+    password: false
+  - name: FOX_QQ_BOT_IMAGE_OPENAI_MODEL
+    description: "openai 方案模型(默认 gpt-image-2)"
+    password: false
+  - name: FOX_QQ_BOT_IMAGE_OPENAI_SIZE
+    description: "openai 方案默认分辨率(内置默认 auto;AI 可按次覆盖)"
+    password: false
+  - name: FOX_QQ_BOT_IMAGE_OPENAI_REF
+    description: "openai 方案参考图(图生图)开关,默认 false(开启走 /images/edits;通用兼容服务不支持时保持关闭)"
+    password: false
+  - name: FOX_QQ_BOT_IMAGE_DOUBAO_API_KEY
+    description: "生图方案 doubao(火山方舟 Seedream)的 API Key;默认空=该方案关闭"
+    password: true
+  - name: FOX_QQ_BOT_IMAGE_DOUBAO_BASE_URL
+    description: "doubao 方案接口地址(默认 https://ark.cn-beijing.volces.com/api/v3)"
+    password: false
+  - name: FOX_QQ_BOT_IMAGE_DOUBAO_MODEL
+    description: "doubao 方案方舟模型号(必填,如 doubao-seedream-4-0-250828;填了 KEY 缺它=配置错误,该方案不生效)"
+    password: false
+  - name: FOX_QQ_BOT_IMAGE_DOUBAO_SIZE
+    description: "doubao 方案默认分辨率(内置默认 1K;AI 可按次覆盖)"
+    password: false
+  - name: FOX_QQ_BOT_IMAGE_DOUBAO_REF
+    description: "doubao 方案参考图开关,默认 false(开启经 image 参数传参考图)"
+    password: false
+  - name: FOX_QQ_BOT_IMAGE_DEFAULT
+    description: "多方案同时配置时的默认方案(openai/doubao);不设则告警并取第一个可用"
+    password: false
+  - name: FOX_QQ_BOT_IMAGE_TIMEOUT
+    description: "生图请求超时秒(默认 120)"
+    password: false
   - name: FOX_QQ_BOT_GROUP_ALLOW_ALL_GROUP_USERS
     description: "是否放行群内所有成员触发(默认 true)。设 false 后仅名单内成员+管理员的消息参与触发"
     password: false
@@ -241,6 +277,9 @@ optional_env:
     password: false
   - name: FOX_QQ_BOT_SANDBOX_CONTAINERS
     description: "沙盒容器取文件(默认 auto): auto=读 Hermes terminal.backend,容器型后端才找沙盒、local/ssh 则关闭;hermes=强制标签过滤;all=全部容器;off/空=只查宿主机;或逗号分隔容器名/ID/通配。AI 沙盒里的文件宿主机看不到时 docker cp 取回"
+    password: false
+  - name: FOX_QQ_BOT_DOCKER_CONTAINER_SELECT
+    description: "手动限定沙盒容器(名字或 ID)。设了只认它;没设且发现多个容器时,文件取回/生图注入一律拒绝并提示配置本项(防止落错容器)"
     password: false
   - name: FOX_QQ_BOT_SANDBOX_FETCH_TIMEOUT
     description: "单次 docker 命令超时秒(默认 15)"

@@ -143,6 +143,17 @@ def resolve_emoticon(emoticon: str) -> str | dict:
     return _registry.resolve(emoticon)
 
 
+def is_registry_path(path: str) -> bool:
+    """path 是否为注册表命中的插件自有表情文件(可信,免沙盒边界检查)。
+
+    表情目录是插件自己的宿主机资源,枚举名解析出的路径直接读宿主机是
+    合理的;AI 传的任意路径不会命中这里(注册表按值比对)。
+    """
+    if _registry is None:
+        return False
+    return path in _registry._registry.values()
+
+
 def list_emoticons() -> list[str]:
     """列出所有可用表情名(全局接口)。"""
     if _registry is None:

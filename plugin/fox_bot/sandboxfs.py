@@ -45,9 +45,11 @@ import shutil
 import tempfile
 
 from .config import (
+    DOCKER_CONTAINER_SELECT,
     MEDIA_MAX_MB,
     SANDBOX_CONTAINERS,
     SANDBOX_FETCH_TIMEOUT,
+    TMP_DIR,
     hermes_backend,
     hermes_backend_is_container,
 )
@@ -155,40 +157,113 @@ async def _candidates() -> list[str]:
     return [c for c in out if not (c in seen or seen.add(c))]
 
 
+async def _pick_candidates() -> tuple[list[str], str | None]:
+    """候选容器 + 多容器歧义检查;返回 (候选列表, 歧义错误|None)。
+
+    FOX_QQ_BOT_DOCKER_CONTAINER_SELECT 手动限定时只认限定值(不走发现);
+    未限定而发现多个候选 → 拒绝操作并给配置指引——多容器下"逐个试"
+    有取错/注入错容器的风险,必须显式指定。
+    """
+    if DOCKER_CONTAINER_SELECT:
+        return [DOCKER_CONTAINER_SELECT], None
+    names = await _candidates()
+    if len(names) > 1:
+        return [], ("多容器歧义: 发现多个沙盒容器(" + ", ".join(names[:5]) +
+                    "),已拒绝操作以防混淆;请设置 "
+                    "FOX_QQ_BOT_DOCKER_CONTAINER_SELECT=<容器名> 手动限定")
+    return names, None
+
+
 async def fetch(path: str) -> tuple[str | None, list[str]]:
     """从候选容器取回 path,落临时文件。
 
     返回 (临时文件路径 | None, 实际尝试过的容器名列表)。
     命中即停;上次命中的容器排在最前。临时文件由调用方负责删除。
+    多容器且未手动限定时拒绝,列表里只有一条"多容器歧义"说明。
     """
     global _last_hit
     if not enabled() or not path.startswith("/"):
         # 相对路径在"哪个容器的哪个工作目录"下无从谈起,只处理绝对路径
         return None, []
-    names = await _candidates()
+    names, sel_err = await _pick_candidates()
+    if sel_err:
+        logger.warning(f"沙盒取回拒绝: {sel_err}")
+        return None, [sel_err]
     if _last_hit in names:
         names = [_last_hit] + [n for n in names if n != _last_hit]
     tried: list[str] = []
     suffix = os.path.splitext(path)[1][:16]
     for c in names:
         tried.append(c)
-        fd, tmp = tempfile.mkstemp(prefix="fox_sandbox_", suffix=suffix)
+        os.makedirs(TMP_DIR, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix="fox_sandbox_", suffix=suffix, dir=TMP_DIR)
         os.close(fd)
-        rc, err = await _run("docker", "cp", f"{c}:{path}", tmp)
-        if rc == 0 and os.path.isfile(tmp) and os.path.getsize(tmp) > 0:
-            size = os.path.getsize(tmp)
-            if _MAX_BYTES and size > _MAX_BYTES:
-                logger.warning(f"容器 {c} 中 {path} 超过大小上限"
-                               f"({size} > {_MAX_BYTES}),放弃")
-                os.remove(tmp)
-                tried[-1] = f"{c}(文件超过 {MEDIA_MAX_MB:g}MB 上限)"
-                continue
-            _last_hit = c
-            logger.info(f"已从容器 {c} 取回 {path} → {tmp} ({size} 字节)")
-            return tmp, tried
+        ok = False
         try:
-            os.remove(tmp)
-        except OSError:
-            pass
-        logger.debug(f"容器 {c} 无 {path}: {err[:120]}")
+            rc, err = await _run("docker", "cp", f"{c}:{path}", tmp)
+            if rc == 0 and os.path.isfile(tmp) and os.path.getsize(tmp) > 0:
+                size = os.path.getsize(tmp)
+                if _MAX_BYTES and size > _MAX_BYTES:
+                    logger.warning(f"容器 {c} 中 {path} 超过大小上限"
+                                   f"({size} > {_MAX_BYTES}),放弃")
+                    tried[-1] = f"{c}(文件超过 {MEDIA_MAX_MB:g}MB 上限)"
+                    continue
+                ok = True
+                _last_hit = c
+                logger.info(f"已从容器 {c} 取回 {path} → {tmp} ({size} 字节)")
+                return tmp, tried
+            logger.debug(f"容器 {c} 无 {path}: {err[:120]}")
+        finally:
+            # 未成功(含协程被取消)一律清掉临时文件,防泄漏
+            if not ok:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
     return None, tried
+
+
+async def put_file(tmp_path: str, dest_dir: str, stem: str, ext: str
+                   ) -> tuple[str | None, str | None, str]:
+    """反向: 把宿主机文件放进沙盒容器的 dest_dir(生图落盘等场景)。
+
+    目录自动创建;文件名 stem.ext 在该容器内重名时自动加序号避让。
+    命中即停,优先上次命中的容器。返回 (容器名, 最终文件名, 错误描述),
+    成功时错误为空串。
+    """
+    global _last_hit
+    if not enabled():
+        return None, None, "沙盒未启用"
+    names, sel_err = await _pick_candidates()
+    if sel_err:
+        logger.warning(f"沙盒注入拒绝: {sel_err}")
+        return None, None, sel_err
+    if _last_hit in names:
+        names = [_last_hit] + [n for n in names if n != _last_hit]
+    if not names:
+        return None, None, "未发现沙盒容器"
+    last_err = ""
+    for c in names:
+        rc, err = await _run("docker", "exec", c, "mkdir", "-p", dest_dir)
+        if rc != 0:
+            last_err = f"{c}: mkdir {dest_dir} 失败: {err[:120]}"
+            continue
+        name, i = f"{stem}.{ext}", 1
+        while True:
+            rc, _ = await _run("docker", "exec", c, "test", "-e",
+                               f"{dest_dir}/{name}")
+            if rc != 0:
+                break
+            i += 1
+            if i > 99:   # 极端兜底: 同秒 99 张,退到随机后缀
+                name = f"{stem}_{os.urandom(3).hex()}.{ext}"
+                break
+            name = f"{stem}_{i}.{ext}"
+        rc, err = await _run("docker", "cp", tmp_path, f"{c}:{dest_dir}/{name}")
+        if rc != 0:
+            last_err = f"{c}: docker cp 失败: {err[:120]}"
+            continue
+        _last_hit = c
+        logger.info(f"已放入容器 {c}:{dest_dir}/{name}")
+        return c, name, ""
+    return None, None, last_err or "全部候选容器失败"

@@ -92,6 +92,7 @@ from .config import (
     STATE_FILE,
     STATE_SAVE_INTERVAL,
     TIMER_INTERVAL,
+    TMP_DIR,
     TIMEZONE,
     TIMEOUT_TRACE_MAX_CHARS,
     TIMEOUT_TRACE_MAX_ITEMS,
@@ -652,6 +653,7 @@ class QQEngine:
 
     async def start(self) -> None:
         check_prompt_files()
+        self._clean_tmp_dir()  # 清空上次运行残留的临时文件(取消/崩溃遗留)
         self.load_states()
         self.load_members()  # 加载持久化的成员缓存
         await media_store.start()
@@ -695,6 +697,32 @@ class QQEngine:
         self.save_states()
         self.save_members()  # 保存成员缓存
         logger.info("引擎已停止,状态已落盘")
+
+    @staticmethod
+    def _clean_tmp_dir() -> None:
+        """启动时清空插件临时目录(fox_bot_data/tmp)。
+
+        沙盒取回/生图中转文件正常在 finally 里即删;这里兜底清理
+        上次运行异常退出(kill -9/断电/任务取消竞态)遗留的孤儿文件。
+        启动时刻没有并发发送,清空是安全的。
+        """
+        if not os.path.isdir(TMP_DIR):
+            return
+        removed = 0
+        try:
+            for name in os.listdir(TMP_DIR):
+                p = os.path.join(TMP_DIR, name)
+                try:
+                    if os.path.isfile(p):
+                        os.remove(p)
+                        removed += 1
+                except OSError:
+                    pass
+        except OSError as e:
+            logger.warning(f"临时目录清理失败 {TMP_DIR}: {e}")
+            return
+        if removed:
+            logger.info(f"已清理临时目录残留 {removed} 个文件: {TMP_DIR}")
 
     # ---- 状态获取 ----
 
@@ -890,6 +918,9 @@ class QQEngine:
         if ev["type"] in SPONTANEOUS_TYPES:
             for p in st.pending:
                 if p["type"] == ev["type"] and p.get("keyword") == ev.get("keyword"):
+                    if DEBUG_TRIGGER:
+                        gid = next((g for g, s in self.group_states.items() if s is st), "?")
+                        logger.info(f"[trigger] 同类自发事件已在队,丢弃 group={gid} type={ev['type']}")
                     return
         self._queue_push(st, ev)
         st.cooldown_until = time.monotonic() + SHARED_COOLDOWN
@@ -1533,11 +1564,15 @@ class QQEngine:
 
         if ev["type"] == "proactive":
             if not snapshot:
+                logger.info(f"取件时上下文已空(排队期间被其他回合消费),放弃自发唤醒 "
+                            f"group={group_id} type=proactive")
                 return
             st.last_wake_seq = st.ctx_seq  # 记录本次唤醒时的会话序号(无变化守卫用)
             user_content = f"{block}\n\n{load_proactive_prompt()}"
         elif ev["type"] == "keyword":
             if not snapshot:
+                logger.info(f"取件时上下文已空(排队期间被其他回合消费),放弃自发唤醒 "
+                            f"group={group_id} type=keyword")
                 return
             keyword_prompt = load_keyword_prompt().replace("{keyword}", ev["keyword"])
             user_content = f"{block}\n\n{keyword_prompt}"
@@ -1559,6 +1594,8 @@ class QQEngine:
         full_text = f"{scene}\n\n{user_content}" if scene else user_content
 
         chat_id = make_chat_id("group", group_id, st.session_suffix)
+        # "定时概率触发"等日志只代表事件入队;这一行才是真正递交给 AI(唤醒成立)
+        logger.info(f"唤醒注入 chat={chat_id} type={ev['type']} 上下文={len(snapshot)}行")
         try:
             await self._run_turn(chat_id, st, full_text)
         except Exception as e:
@@ -1599,6 +1636,7 @@ class QQEngine:
                 body = f"[msg_id#{ev['message_id']}] {message_plain_text(event)}" if event else ev.get("text", "")
         full_text = f"{scene}\n\n{body}" if scene else body
         chat_id = make_chat_id("private", user_id, pst.session_suffix)
+        logger.info(f"唤醒注入 chat={chat_id} type={ev.get('type', 'private')}")
         try:
             await self._run_turn(chat_id, pst, full_text)
         except Exception as e:
