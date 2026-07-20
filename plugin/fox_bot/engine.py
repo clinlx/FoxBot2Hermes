@@ -221,6 +221,15 @@ def message_plain_text(event: dict) -> str:
     )
 
 
+# 值得注入展示的媒体段类型(format_line/seg_marker 能渲染出有信息量的标记)
+_MEDIA_SEG_TYPES = {"image", "record", "video", "file", "forward", "json", "mface"}
+
+
+def has_media_content(event: dict) -> bool:
+    """消息是否含可展示的媒体段(图片/语音/视频/文件/合并转发/卡片/大表情)。"""
+    return any(seg.get("type") in _MEDIA_SEG_TYPES for seg in _segments(event))
+
+
 def format_line(event: dict, members: list[dict] | None = None) -> str:
     """一条群消息 → 注入用的一行文本(带消息 ID 与发送者 QQ 号,供模型引用/@)。
 
@@ -252,7 +261,10 @@ def format_line(event: dict, members: list[dict] | None = None) -> str:
             name = qq_to_name.get(qq, qq) if members else qq
             parts.append(f"@{name}")
         elif stype == "reply":
-            continue
+            # 引用/回复段: 渲染成 [引用#消息ID],AI 由此知道该消息引用了哪条
+            rid = str(data.get("id") or "").strip()
+            if rid:
+                parts.append(f"[引用#{rid}] ")
         else:
             marker = seg_marker(seg)
             parts.append(marker if marker is not None else f"[{stype}]")
@@ -1330,10 +1342,12 @@ class QQEngine:
 
         try:
             text = message_plain_text(event)
-            if not text:
+            if text and await self.admin_commands.try_handle(event, text):
                 return
-
-            if await self.admin_commands.try_handle(event, text):
+            # 纯媒体消息(语音/图片/文件等)也接收: format_line 会渲染成
+            # [语音|名字|大小|链接] 等标记注入,AI 可用 STT/下载等工具跟进。
+            # 既无文本也无媒体段(纯 at/空消息)才忽略
+            if not text and not has_media_content(event):
                 return
 
             pst = self.get_private_state(user_id)
@@ -1345,10 +1359,8 @@ class QQEngine:
                 return
             pst.last_accepted = now
 
-            # 新好友问候: 对方先开口且本条消息即将入队(AI 会顺着它回)→
-            # 取消未触发的问候定时器,已入队未处理的问候事件一并移除。
-            # 纯图片/表情这类不进管线的消息不算"开口",问候仍会发出,
-            # 否则会出现"对方发了表情包、问候也被取消、双方沉默"的死局。
+            # 新好友问候: 对方先开口(文本或语音/图片等媒体消息,均会入队被回应)
+            # → 取消未触发的问候定时器,已入队未处理的问候事件一并移除
             greet_task = self._greet_tasks.pop(user_id, None)
             if greet_task is not None and not greet_task.done():
                 greet_task.cancel()

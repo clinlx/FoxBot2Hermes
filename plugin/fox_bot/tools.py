@@ -942,23 +942,6 @@ TOOL_SPECS: list[dict] = [
         "handler": tool_get_forward_msg,
     },
     {
-        "name": "fox_qq_ocr_image",
-        "description": (
-            "识别图片中的文字(QQ 自带 OCR)。二选一: 传 message_id(msg_id#后的数字,"
-            "识别该消息里的图片,多图逐张识别)或传 image(图片 URL)。返回识别出的文本。"
-        ),
-        "schema": {
-            "type": "object",
-            "properties": {
-                "message_id": {"type": "string",
-                               "description": "含图片的消息 ID(取自 msg_id#)"},
-                "image": {"type": "string", "description": "图片 URL(与 message_id 二选一)"},
-            },
-            "required": [],
-        },
-        "handler": tool_ocr_image,
-    },
-    {
         "name": "fox_qq_voice_to_text",
         "description": (
             "语音转文字(QQ 自带识别)。传含语音消息的 message_id(msg_id#后的数字),"
@@ -977,10 +960,31 @@ TOOL_SPECS: list[dict] = [
 ]
 
 # 下列工具默认禁用(已实现但未注册进 TOOL_SPECS),需要时手动启用:
+# - fox_qq_ocr_image: QQ 自带 OCR——NapCat 的实现走 NTQQ wantWinScreenOCR,
+#   官方注明"仅Windows端支持",Linux 部署下永不响应(90s 超时),故下线;
+#   图片识别建议由 AI 在终端沙盒用 tesseract 等本地 OCR 完成
 # - fox_qq_emoji_react: 消息表情回应
 # - fox_qq_poke: 戳一戳
 # - fox_qq_delete_msg: 撤回消息
 DISABLED_TOOL_SPECS: list[dict] = [
+    {
+        "name": "fox_qq_ocr_image",
+        "description": (
+            "识别图片中的文字(QQ 自带 OCR,NapCat 仅 Windows 端支持,Linux 下超时)。"
+            "二选一: 传 message_id(msg_id#后的数字,识别该消息里的图片,多图逐张识别)"
+            "或传 image(图片 URL)。返回识别出的文本。"
+        ),
+        "schema": {
+            "type": "object",
+            "properties": {
+                "message_id": {"type": "string",
+                               "description": "含图片的消息 ID(取自 msg_id#)"},
+                "image": {"type": "string", "description": "图片 URL(与 message_id 二选一)"},
+            },
+            "required": [],
+        },
+        "handler": tool_ocr_image,
+    },
     {
         "name": "fox_qq_emoji_react",
         "description": (

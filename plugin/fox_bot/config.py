@@ -200,8 +200,8 @@ DEFAULT_CRON_PROMPT = (
 # 私聊白名单用户 → 自动调用 set_friend_add_request 同意;其余请求仅记日志,
 # 留待 QQ 客户端手动处理。通过后延迟 FRIEND_GREET_DELAY 秒唤醒该私聊,
 # 让 AI 主动打一次招呼(模版 prompts/friend.txt,{{Comment}}=对方验证消息);
-# 等待期间对方先开口(发来会被接收处理的消息)则自动取消问候——AI 顺着
-# 对方的消息回更自然;纯图片/表情这类不进管线的消息不算,问候仍会发出。
+# 等待期间对方先开口(文本或语音/图片等媒体消息)则自动取消问候——
+# AI 顺着对方的消息回更自然。
 FRIEND_AUTO_ACCEPT = _env_bool("FOX_QQ_BOT_FRIEND_AUTO_ACCEPT", "true")
 FRIEND_GREET_DELAY = _env_float("FOX_QQ_BOT_FRIEND_GREET_DELAY", 60)  # <=0 = 不问候
 FRIEND_PROMPT_PATH = _prompt_path("FOX_QQ_BOT_FRIEND_PROMPT_PATH", "friend.txt")
