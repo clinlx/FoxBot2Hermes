@@ -141,12 +141,14 @@ class ChatState:
         self.turn_retries: int = 0
         # 本轮 [CONTINUE_THINK] 续想次数(独立于纠正计数)
         self.turn_continues: int = 0
-        # 本轮是否调用过工具: 未代发的正文与工具并存时视为附带描述,不纠正
+        # 本轮是否调用过工具(超时轨迹/诊断用)
         self.turn_tool_called: bool = False
+        # 本轮是否用过发送消息接口(fox_qq_send_message,含用它发 NO_REPLY——
+        # 想起来用工具就算)。不影响拦截/代发,只决定收尾提醒是否附加
+        # "本回合未用过发送接口"一段;只读工具不算。
+        self.turn_message_sent: bool = False
         # 挂起的正文(碎碎念): 等管线收尾(_settle_pending_bare)统一判定
         self.pending_bare: str | None = None
-        # 挂起正文是否已成功代发(决定收尾用"补标记提醒"还是"发送失败纠正")
-        self.pending_bare_sent: bool = False
         # 回合轨迹: 本轮的 (角色, 摘要) 条目,超时报错时随通知输出。
         # 只记 USER 递交/AI 回答/工具调用及成败,不含 AI 思考与工具详细输出。
         self.turn_trace: deque[str] = deque(maxlen=TIMEOUT_TRACE_MAX_ITEMS)
@@ -948,6 +950,7 @@ class QQEngine:
         state.turn_retries = 0
         state.turn_continues = 0
         state.turn_tool_called = False
+        state.turn_message_sent = False
         state.pending_bare = None
         state.turn_done.clear()
         state.turn_trace.clear()
@@ -1002,8 +1005,9 @@ class QQEngine:
         """adapter.send() 的实现: 回合结束协议校验点。
 
         双通道: fox_qq_send_message 工具是首选出口;正文(碎碎念)在
-        CHATTER_AUTOSEND 开启时也即时代发。收尾仍只认最后一段是否为
-        [NO_REPLY]/[CONTINUE_THINK],不是则提醒补结束标记(非纠错)。
+        CHATTER_AUTOSEND 开启时简单过滤后忠实代发,关闭时拦截不发。
+        不管开关,[NO_REPLY] 都是回合收尾的必要条件——未带标记的正文
+        挂起到管线收尾,按情形提醒/纠正(绝不静默丢弃或隐式结束回合)。
         """
         ctype, target, _suffix = parse_chat_id(chat_id)
         state = self._find_state(ctype, target)
@@ -1050,83 +1054,68 @@ class QQEngine:
                 "已放行,请继续。后续发言尽量通过 fox_qq_send_message 工具,"
                 "全部完成后以单行 [NO_REPLY] 结束。")
             return
+        # 不管 CHATTER_AUTOSEND 开关,回合都必须由 [NO_REPLY] 收尾——
+        # 裸正文既不隐式结束回合也不丢弃。末尾打包了 [NO_REPLY] 的先拆出结束信号
+        body, ended = split_end_marker(content)
         if CHATTER_AUTOSEND:
-            # 双通道: 正文即时代发。末尾若打包了 [NO_REPLY] 则拆出,代发正文后干净结束
-            body, ended = split_end_marker(content)
+            # 开: 正文(碎碎念)简单过滤后忠实代发
             if body.strip():
                 await self._relay_chatter(chat_id, state, body)
-            if ended:
-                logger.debug(f"正文+NO_REPLY 打包,代发后结束回合 chat={chat_id}")
-                state.turn_done.set()
-                return
-            # 无结束标记: 挂起,收尾时提醒补结束标记(内容已代发,非纠错)
-            state.pending_bare = content
-            logger.info(f"正文已代发,挂起待收尾提醒补结束标记 chat={chat_id}: {content[:120]!r}")
-            return
-        # CHATTER_AUTOSEND 关: 正文不代发
-        if state.turn_tool_called:
-            # 本回合已调用过工具: 正文视为工具的附带描述,工具已是有效出口,
-            # 不再纠正以免打断流程,直接结束回合。
-            logger.info(f"本回合已调用工具,正文视为附带描述,结束回合 "
-                        f"chat={chat_id}: {content[:120]!r}")
-            state.turn_trace.append("AI: (工具+正文并存,不纠正,结束回合)")
+        else:
+            # 关: 正文拦截不代发(不丢弃语义——挂起等收尾按情形提醒)
+            logger.info(f"正文已拦截(CHATTER_AUTOSEND=off) chat={chat_id}: {content[:120]!r}")
+            state.turn_trace.append("AI: (正文已拦截,未代发)")
+        if ended:
+            # 自带结束标记: 回合正常结束(开=代发后结束;关=拦截后结束)
+            logger.debug(f"正文附带 NO_REPLY,结束回合 chat={chat_id}")
             state.turn_done.set()
             return
-        # 疑似裸回复: 不立即纠正——正文可能与内部工具调用(search_files 等,
-        # 插件不可见)同消息下发。挂起等管线收尾(_settle_pending_bare):
-        # 期间有任何工具调用则撤销;收尾时仍无工具调用才确认纠正。
+        # 未带结束标记: 挂起,管线收尾时按情形提醒补 [NO_REPLY](不结束回合)
         state.pending_bare = content
-        logger.info(f"疑似裸回复,挂起待收尾判定 chat={chat_id}: {content[:120]!r}")
+        logger.info(f"正文未带结束标记,挂起待收尾提醒 chat={chat_id}: {content[:120]!r}")
 
     async def _settle_pending_bare(self, chat_id: str, state: ChatState) -> None:
-        """管线收尾时判定挂起的正文。
+        """管线收尾时处理挂起的正文: 不管开关,[NO_REPLY] 都是必须的。
 
         由 mark_turn_end(quiet=True, gateway 管线收尾兜底)触发——
         此时我们重新获得调用权,AI 的工具调用(含插件不可见的内部工具)已全部执行完。
-        - CHATTER_AUTOSEND 开: 正文已在 on_agent_reply 即时代发,这里只温和提醒
-          补结束标记(非纠错,达上限直接结束,不通知错误);
-        - CHATTER_AUTOSEND 关: turn_tool_called 未置位即真裸回复,走纠正打回。
+        回合不隐式结束,一律重开提醒补 [NO_REPLY]:
+        - CHATTER_AUTOSEND 开: 正文已代发 → 告知已发送,补结束标记;
+        - 关: 正文被拦截 → 纠正打回(告知发送失败,改用工具重发)。
+        本回合没用过发送接口(turn_message_sent=False,用工具发 NO_REPLY 也算
+        用过)时,提示词额外附加提醒;有没有用过不改变拦截/代发行为本身。
+        提醒/纠正共用 PROTOCOL_RETRY 上限,超限强制结束回合。
         """
         content = state.pending_bare
         state.pending_bare = None
         if content is None:
             return
+        if state.turn_retries >= PROTOCOL_RETRY:
+            msg = "提醒/纠正重试耗尽,agent 持续不给 [NO_REPLY] 收尾"
+            logger.warning(f"{msg},强制结束回合 chat={chat_id}: {content[:200]!r}")
+            state.turn_done.set()
+            await self._notify_error(chat_id, msg, f"最后回复: {content[:500]}")
+            return
+        state.turn_retries += 1
         if CHATTER_AUTOSEND:
-            # 正文已代发,只需提醒补结束标记
-            if state.turn_retries < PROTOCOL_RETRY:
-                state.turn_retries += 1
-                logger.info(
-                    f"正文已代发,提醒补结束标记第 {state.turn_retries}/{PROTOCOL_RETRY} 次 "
-                    f"chat={chat_id}: {content[:120]!r}"
-                )
-                state.turn_trace.append(
-                    f"USER: (代发后提醒补结束标记 {state.turn_retries}/{PROTOCOL_RETRY})")
-                state.turn_done.clear()
-                await self.submit(chat_id, CHATTER_RELAY_PROMPT)
-                return
-            logger.info(f"提醒补结束标记达上限,直接结束回合 chat={chat_id}")
-            state.turn_trace.append("USER: (提醒补结束标记达上限,结束回合)")
-            state.turn_done.set()
-            return
-        if state.turn_tool_called:
-            logger.info(f"收尾判定: 正文与工具并存,不纠正 chat={chat_id}: {content[:80]!r}")
-            state.turn_done.set()
-            return
-        if state.turn_retries < PROTOCOL_RETRY:
-            state.turn_retries += 1
-            logger.info(
-                f"裸回复违反工具唯一出口协议,纠正第 {state.turn_retries}/{PROTOCOL_RETRY} 次 "
-                f"chat={chat_id}: {content[:120]!r}"
+            # 正文已代发,提醒补结束标记
+            prompt = CHATTER_RELAY_PROMPT
+            reason = "正文已代发,提醒补结束标记"
+        else:
+            # 正文被拦截: 纠正打回,要求改用工具重发
+            prompt = CORRECTION_PROMPT
+            reason = "裸回复违反工具唯一出口协议,纠正"
+        if not state.turn_message_sent:
+            prompt += (
+                "\n注意: 你本回合还没有用过 fox_qq_send_message 发送接口,"
+                "如果有想对用户说的话,记得先用它发送。"
             )
-            state.turn_trace.append(f"USER: (裸回复协议纠正 {state.turn_retries}/{PROTOCOL_RETRY})")
-            # 重开回合: 纠正轮不携带上下文注入块、不计任何触发/热度统计
-            state.turn_done.clear()
-            await self.submit(chat_id, CORRECTION_PROMPT)
-            return
-        msg = "纠正重试耗尽,agent 持续裸回复"
-        logger.warning(f"{msg},丢弃内容并强制结束回合 chat={chat_id}: {content[:200]!r}")
-        state.turn_done.set()
-        await self._notify_error(chat_id, msg, f"最后回复: {content[:500]}")
+        logger.info(f"{reason}第 {state.turn_retries}/{PROTOCOL_RETRY} 次 "
+                    f"chat={chat_id} 已用发送接口={state.turn_message_sent}: {content[:120]!r}")
+        state.turn_trace.append(f"USER: ({reason} {state.turn_retries}/{PROTOCOL_RETRY})")
+        # 重开回合: 提醒/纠正轮不携带上下文注入块、不计任何触发/热度统计
+        state.turn_done.clear()
+        await self.submit(chat_id, prompt)
 
     def mark_turn_end(self, chat_id: str | None, quiet: bool = False) -> None:
         """工具侧/管线收尾的结束回合信号(幂等)。
@@ -1145,9 +1134,13 @@ class QQEngine:
         if state.turn_done.is_set():
             return  # 幂等: 已结束无需重复
         if quiet:
+            if state.pending_bare is not None:
+                # 有挂起正文: 回合不在此结束,交 _settle_pending_bare 决定
+                # (重开提醒/纠正,或重试耗尽时由它强制结束)
+                logger.info(f"管线收尾,挂起正文待判定(回合保持开启) chat={chat_id}")
+                asyncio.create_task(self._settle_pending_bare(chat_id, state))
+                return
             logger.info(f"回合经管线收尾兜底结束(gateway 静默抑制了最终回复) chat={chat_id}")
-            # 管线收尾时判定挂起的裸回复: 此时所有工具调用已完成
-            asyncio.create_task(self._settle_pending_bare(chat_id, state))
         else:
             logger.info(f"回合经工具 NO_REPLY 结束 chat={chat_id}")
         state.turn_done.set()
@@ -1157,12 +1150,16 @@ class QQEngine:
         """工具层回报: 本回合调用了什么工具、成功还是失败(超时轨迹用)。
 
         只记名称+成败+一句摘要,不含工具详细输出。chat 找不到时静默忽略。
+        fox_qq_send_message 调用成功即置位 turn_message_sent(含用它发
+        NO_REPLY 结束信号——想起来用工具发消息就算用过)。
         """
         ctype, target, _suffix = parse_chat_id(chat_id or "")
         state = self._find_state(ctype, target)
         if state is None:
             return
         state.turn_tool_called = True  # 标记本回合已调用工具
+        if tool == "fox_qq_send_message" and ok:
+            state.turn_message_sent = True
         mark = "成功" if ok else "失败"
         entry = f"工具 {tool}: {mark}"
         if brief:
