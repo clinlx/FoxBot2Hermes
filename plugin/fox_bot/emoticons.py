@@ -70,29 +70,36 @@ class EmoticonRegistry:
 
         优先级:
         1. 枚举名(不区分大小写) → 注册表里的路径
-        2. 完整本地路径(绝对路径,文件存在) → 原样返回
+        2. 完整本地路径 → 原样返回(不校验宿主机存在性,交由下游
+           _prepare_local 按沙盒边界解析,详见安全说明)
         3. URL(http/https 开头) → 原样返回
         4. 都不是 → 返回错误
+
+        安全: 这里对本地路径**不做 os.path.isfile 校验**。表情目录内的
+        枚举名(分支 1)是插件自有资源、可信;但 AI 直接传的绝对路径若在
+        此处 isfile 命中宿主机,就成了绕过沙盒读宿主机文件的入口
+        (confused deputy)。故本地路径原样透传,由 _send_emoticon →
+        _prepare_local 统一按"沙盒开启则只从容器取、绝不读宿主机"处理。
         """
         emoticon = emoticon.strip()
         debug = _debug_on()
         if not emoticon:
             return {"error": "emoticon 字段为空"}
 
-        # 1. 枚举名
+        # 1. 枚举名(插件自有表情目录内的资源,可信)
         key = emoticon.lower()
         if key in self._registry:
             if debug:
                 logger.debug(f"[emoticon] 命中枚举名 '{emoticon}' → {self._registry[key]}")
             return self._registry[key]
 
-        # 2. 完整本地路径
-        if os.path.isabs(emoticon) and os.path.isfile(emoticon):
+        # 2. 完整本地路径: 只按扩展名初筛,不 isfile(宿主机)——交下游按沙盒边界取
+        if os.path.isabs(emoticon):
             _, ext = os.path.splitext(emoticon)
             if ext.lower() not in IMAGE_EXTS:
                 return {"error": f"表情路径文件扩展名不是图片: {emoticon}"}
             if debug:
-                logger.debug(f"[emoticon] 未命中枚举,按本地路径处理: {emoticon}")
+                logger.debug(f"[emoticon] 未命中枚举,按本地路径透传(下游按沙盒取): {emoticon}")
             return emoticon
 
         # 3. URL

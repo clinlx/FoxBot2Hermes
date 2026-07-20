@@ -49,6 +49,12 @@ NAPCAT_WS_PORT = _env_int("FOX_QQ_BOT_NAPCAT_WS_PORT", 18197)
 NAPCAT_WS_HOST = _env_str("FOX_QQ_BOT_NAPCAT_WS_HOST", "0.0.0.0")
 # NapCat API 调用超时(秒)
 NAPCAT_CALL_TIMEOUT = _env_float("FOX_QQ_BOT_NAPCAT_CALL_TIMEOUT", 30)
+# 发消息类接口(send_*msg / upload_*file 等)遇到 NapCat 内部 sendMsg 超时
+# (retcode=1200,message 含 Timeout/EventChecker,来自 onMsgInfoListUpdate
+# 监听器)时,视为"很可能已送达"而非硬失败——因为 NapCat 只是等发送确认
+# 事件超时,消息实际多半已发出。此时返回软成功,避免 AI 误判失败重发导致
+# 重复消息(尤其图片/富媒体上传慢时高发)。默认开启;设 false 恢复严格报错。
+NAPCAT_SEND_TIMEOUT_AS_SUCCESS = _env_bool("FOX_QQ_BOT_NAPCAT_SEND_TIMEOUT_AS_SUCCESS", "true")
 # 接入鉴权 token: 对应 NapCat websocketClient 配置里的 "token"。
 # 非空时,WS 握手必须带 Authorization: Bearer <token>(或裸 token),否则拒接。
 # 留空=不校验(向后兼容;但 0.0.0.0 裸监听建议务必设置,防他人冒充 NapCat 连入)。
@@ -143,40 +149,41 @@ CRON_PROMPT_PATH = _prompt_path("FOX_QQ_BOT_CRON_PROMPT_PATH", "cron.txt")
 DEFAULT_GROUP_PROMPT = (
     "{{INJECT}}\n"
     "[当前时间] {{TIME}}\n"
-    "[当前场景] QQ 群聊,群号 {{GROUP_ID}},群名「{{GROUP_NICKNAME}}」。"
+    "[当前场景] QQ私聊 ; 群号 {{GROUP_ID}} ; 群名: {{GROUP_NICKNAME}}\n"
     "保持你一贯的性格和说话方式。发言用 fox_qq_send_message 工具发出(可多条);"
     "消息前缀 [msg_id#数字][昵称(qq_id@QQ号)] 中,msg_id 是消息 ID,qq_id 是发送者 QQ 号;"
     "引用某条就把 [#reply@消息ID] 放在 content 最开头;@人用 qq_id 而非 msg_id;"
-    "不必开口时回复单独一行 [NO_REPLY] 结束。QQ 不渲染 Markdown,用纯文本。"
+    "不必开口时回复单独一行 [NO_REPLY] 结束。QQ 不渲染 Markdown,用纯文本"
 )
 DEFAULT_PRIVATE_PROMPT = (
     "{{INJECT}}\n"
     "[当前时间] {{TIME}}\n"
-    "[当前场景] QQ 私聊,对方昵称「{{USER_NICKNAME}}」(QQ号 {{USER_ID}})。"
+    "[当前场景] QQ私聊 ; 对方QQ号 {{USER_ID}} ; 昵称: {{USER_NICKNAME}}\n"
     "保持你一贯的性格和说话方式。发言用 fox_qq_send_message 工具发出(可多条);"
-    "不必回应时回复单独一行 [NO_REPLY] 结束。QQ 不渲染 Markdown,用纯文本。"
+    "不必回应时回复单独一行 [NO_REPLY] 结束。QQ 不渲染 Markdown,用纯文本;"
 )
 DEFAULT_PROACTIVE_PROMPT = (
     "[当前时间] {{TIME}}\n"
-    "以上是群里最近的聊天。没有人叫你,但你可以自己决定要不要插一句:"
-    "接话、补充信息、开个玩笑都行,一两句即可,用 fox_qq_send_message 工具发送。"
-    "没什么值得说的就不调用工具,直接回复 [NO_REPLY] 结束。"
+    "以上是群里最近的聊天。没有人叫你,但你可以自己决定要不要插一句:\n"
+    "接话、补充信息、开个玩笑都行,一两句即可,用 fox_qq_send_message 工具发送;"
+    "没什么值得说的就不调用工具,直接回复 [NO_REPLY] 结束;"
 )
 DEFAULT_KEYWORD_PROMPT = (
     "[当前时间] {{TIME}}\n"
-    "以上是群里最近的聊天,最后有人提到了「{keyword}」。"
-    "这个话题和你有关,可以接一句(用 fox_qq_send_message 工具发送)。"
-    "没什么值得说的就不调用工具,直接回复 [NO_REPLY] 结束。"
+    "以上是群里最近的聊天,最后有人提到了「{keyword}」\n"
+    "这个话题和你有关,可以接一句(用 fox_qq_send_message 工具发送);"
+    "没什么值得说的就不调用工具,直接回复 [NO_REPLY] 结束;"
 )
 DEFAULT_WAKE_PROMPT = (
     "[当前时间] {{TIME}}\n"
-    "主人刚刚手动把你唤醒了。以上是群里最近的聊天(可能为空)。"
-    "请用 fox_qq_send_message 工具主动说点什么:接上话题、暖个场都行,一两句即可。"
-    "即使群里最近没什么消息,也说点什么打破沉默。"
+    "主人刚刚手动把你唤醒了。以上是群里最近的聊天(可能为空)。\n"
+    "\n"
+    "请用 fox_qq_send_message 工具主动说点什么:接上话题、暖个场都行,一两句即可;"
+    "即使群里最近没什么消息,也说点什么打破沉默;"
 )
 DEFAULT_CRON_PROMPT = (
     "[当前时间] {{TIME}}\n"
-    "刚刚定时任务把你唤醒了。以上是最近的聊天(可能为空表示无新发言)。\n"
+    "刚刚定时任务把你唤醒了。以上是最近的聊天(可能为空表示无新发言)\n"
     "\n"
     "定时任务对你的要求是:\n"
     "<CronTask>\n"
@@ -184,8 +191,31 @@ DEFAULT_CRON_PROMPT = (
     "</CronTask>\n"
     "请执行该任务\n"
     "\n"
-    "* 严禁绕开 fox_qq_send_message 工具发消息;若没什么值得说的,"
-    "直接不使用工具回复 [NO_REPLY] 来结束。"
+    "* 发言尽量通过 fox_qq_send_message 工具发出(引用/@人/表情/分段只有工具能控制);"
+    "若没什么值得说的,直接不使用工具回复 [NO_REPLY] 来结束;"
+)
+
+# ---- 好友请求自动通过(触发式逻辑,非 AI 工具) ----
+# 收到加好友请求(post_type=request/request_type=friend)时,对方是管理员或
+# 私聊白名单用户 → 自动调用 set_friend_add_request 同意;其余请求仅记日志,
+# 留待 QQ 客户端手动处理。通过后延迟 FRIEND_GREET_DELAY 秒唤醒该私聊,
+# 让 AI 主动打一次招呼(模版 prompts/friend.txt,{{Comment}}=对方验证消息);
+# 等待期间对方先开口(发来会被接收处理的消息)则自动取消问候——AI 顺着
+# 对方的消息回更自然;纯图片/表情这类不进管线的消息不算,问候仍会发出。
+FRIEND_AUTO_ACCEPT = _env_bool("FOX_QQ_BOT_FRIEND_AUTO_ACCEPT", "true")
+FRIEND_GREET_DELAY = _env_float("FOX_QQ_BOT_FRIEND_GREET_DELAY", 60)  # <=0 = 不问候
+FRIEND_PROMPT_PATH = _prompt_path("FOX_QQ_BOT_FRIEND_PROMPT_PATH", "friend.txt")
+DEFAULT_FRIEND_PROMPT = (
+    "[当前时间] {{TIME}}\n"
+    "你刚刚自动通过了对方的好友请求,你们现在成为了新好友。\n"
+    "对方申请时填写的验证消息:\n"
+    "<Comment>\n"
+    "{{Comment}}\n"
+    "</Comment>\n"
+    "请用 fox_qq_send_message 工具主动打个招呼:自然一点,"
+    "像刚加上好友那样,一两句即可,可以顺着验证消息接话;\n"
+    "* 发言尽量通过 fox_qq_send_message 工具发出(引用/@人/表情/分段只有工具能控制);"
+    "发完后回复单行 [NO_REPLY] 结束;"
 )
 
 # ---- 定时任务 cron ----
@@ -233,8 +263,9 @@ CHATTER_RELAY_PROMPT = (
     "并保持你独特的性格和人设。"
     "如果任务尚未完成、还需要继续思考或继续执行,可以用 [CONTINUE_THINK] 开头的裸回复继续;"
     "仅当你没有额外的任务要处理,也没有额外的用户消息要回应,"
-    "全部过程已执行到位时,以单个 [NO_REPLY] 结束本次流程。"
-    "输出样例(无额外字符,也无额外的描述语句):\n"
+    "全部过程已执行到位时,回复 [NO_REPLY] 结束本次流程——"
+    "单独回复本标记,或附在最后一段发言正文的末尾、单独成行均可。"
+    "最简输出样例:\n"
     "[NO_REPLY]"
 )
 # 收尾纠正(CHATTER_AUTOSEND 关): 正文未送达,要求改用工具重发
@@ -245,8 +276,9 @@ CORRECTION_PROMPT = (
     "想告知用户的话都通过 fox_qq_send_message 工具发送。"
     "如果任务尚未完成、还需要继续思考或继续执行,可以用 [CONTINUE_THINK] 开头的裸回复继续;"
     "仅当你没有额外的任务要处理,也没有额外的用户消息要回应,"
-    "全部过程已执行到位时,以单个 [NO_REPLY] 结束本次流程。"
-    "输出样例(无额外字符,也无额外的描述语句):\n"
+    "全部过程已执行到位时,回复 [NO_REPLY] 结束本次流程——"
+    "单独回复本标记,或附在最后一段发言正文的末尾、单独成行均可。"
+    "最简输出样例:\n"
     "[NO_REPLY]"
 )
 # gateway 系统通知识别串: send() 下来的裸回复若含这些子串,视为 gateway 自己的
@@ -261,6 +293,16 @@ GATEWAY_NOTICE_MARKERS: list[str] = [
     "⏳ Working",
     "receiving stream response",
     "Credit access restored",
+    # 后台自我改进/运维状态通知(Hermes background_review 等发出的状态条,
+    # 非 AI 对话正文;官方 Discord adapter 亦作 non-conversational 过滤)。
+    "Self-improvement review:",
+    "💾 Memory updated",
+    "[Background process ",
+    "Hermes update finished",
+    "Hermes update failed",
+    "Hermes update timed out",
+    "Gateway restarted successfully",
+    "Gateway online",
 ]
 _gnm_raw = os.getenv("FOX_QQ_BOT_GATEWAY_NOTICE_MARKERS")
 if _gnm_raw and _gnm_raw.strip():
@@ -383,6 +425,80 @@ MEDIA_FILE = _env_str(
     "FOX_QQ_BOT_MEDIA_FILE",
     os.path.join(os.path.expanduser("~"), ".hermes", "fox_bot_data", "media.json"),
 )
+
+# ---- 沙盒容器取文件 ----
+# AI 终端可能跑在与 gateway 隔离的容器沙盒里(Hermes 按 config.yaml 的
+# terminal.backend 决定后端;docker/singularity/modal/daytona 为容器型,
+# 每会话/共享一个容器执行终端与文件工具): 它生成的本地文件宿主机看不到
+# (发图报"识别URL失败"却查无此文件)。发送工具在宿主机找不到绝对路径
+# 时,按候选容器逐个 docker cp 取回(临时文件,发完即删)。取值:
+#   auto(默认) = 先读 Hermes 后端类型判断该不该找容器(见 hermes_backend):
+#                容器型后端 → 用官方标签 label=hermes-agent=1 精准过滤沙盒;
+#                local/ssh 等非容器后端 → 直接关闭(文件本就在宿主机);
+#   hermes      = 强制用标签过滤(不看后端类型);
+#   all         = 扫全部运行中容器(不加标签,兜底);
+#   off/空      = 关闭,只查宿主机;
+#   名单/通配   = 逗号分隔的容器名/ID/通配(fnmatch,如 mybox-*),
+#                给了名单就按名单来(与上述关键字互斥)。
+# 需要 gateway 用户有 docker 权限;无 docker CLI 时自动禁用。
+SANDBOX_CONTAINERS = _env_str("FOX_QQ_BOT_SANDBOX_CONTAINERS", "auto")
+# 单次 docker 命令超时(秒)
+SANDBOX_FETCH_TIMEOUT = _env_float("FOX_QQ_BOT_SANDBOX_FETCH_TIMEOUT", 15)
+
+# Hermes 终端后端类型: 容器型集合(这些后端下 AI 文件在容器里,需取回)
+CONTAINER_BACKENDS = {"docker", "singularity", "modal", "daytona"}
+
+
+def _hermes_config_path() -> str:
+    """Hermes config.yaml 路径: HERMES_HOME 优先,否则 ~/.hermes(与其 CLI 一致)。"""
+    home = os.getenv("HERMES_HOME") or os.path.join(os.path.expanduser("~"), ".hermes")
+    return os.path.join(home, "config.yaml")
+
+
+_backend_cache: str | None = None
+
+
+def hermes_backend() -> str:
+    """读 Hermes config.yaml 的 terminal.backend(小写),读不到返回空串。
+
+    权威来源: gateway 运行时 TERMINAL_ENV 不导出到 os.environ(仅 config.yaml
+    内部解析),所以直接读 config.yaml。只取 terminal.backend 一个标量,
+    用轻量逐行解析避免依赖 yaml 库(Hermes 环境虽有,但保持零依赖更稳)。
+    结果缓存(后端类型进程内不变)。
+    """
+    global _backend_cache
+    if _backend_cache is not None:
+        return _backend_cache
+    _backend_cache = ""
+    path = _hermes_config_path()
+    try:
+        with open(path, encoding="utf-8") as f:
+            in_terminal = False
+            for raw in f:
+                line = raw.rstrip("\n")
+                if not line.strip() or line.lstrip().startswith("#"):
+                    continue
+                # 顶层键(无缩进): 进入/离开 terminal: 段
+                if not line[:1].isspace():
+                    in_terminal = line.strip().rstrip(":") == "terminal" or line.strip() == "terminal:"
+                    continue
+                if in_terminal:
+                    s = line.strip()
+                    if s.startswith("backend:"):
+                        val = s.split(":", 1)[1].strip().strip("\"'").lower()
+                        _backend_cache = val
+                        break
+    except OSError:
+        pass  # 读不到(权限/不存在): 空串,由调用方回退探测
+    return _backend_cache
+
+
+def hermes_backend_is_container() -> bool | None:
+    """Hermes 后端是否容器型: True/False;读不到配置返回 None(调用方回退)。"""
+    b = hermes_backend()
+    if not b:
+        return None
+    return b in CONTAINER_BACKENDS
 
 # ---- 输出 ----
 IMAGE_URL_AS_IMAGE = _env_bool("FOX_QQ_BOT_IMAGE_URL_AS_IMAGE", "true")

@@ -37,9 +37,21 @@ optional_env:
     description: "接入鉴权 token,对应 NapCat websocketClient 的 token;非空时校验握手 Authorization,留空=不校验"
     prompt: "NapCat WS access token"
     password: true
+  - name: FOX_QQ_BOT_NAPCAT_SEND_TIMEOUT_AS_SUCCESS
+    description: "发消息遇 NapCat 内部 sendMsg 确认超时(retcode=1200,含 Timeout/EventChecker)时视为已送达(默认 true),避免 AI 误判失败重发导致重复消息;设 false 恢复严格报错"
+    password: false
   - name: FOX_QQ_BOT_ALLOWED_PRIVATE
-    description: "私聊白名单 QQ 号,逗号分隔(空=关闭私聊)"
+    description: "私聊白名单 QQ 号,逗号分隔(空=关闭普通用户私聊;管理员 ADMIN_QQ 收发均不受此限)"
     prompt: "Allowed private QQ numbers"
+    password: false
+  - name: FOX_QQ_BOT_FRIEND_AUTO_ACCEPT
+    description: "好友请求自动通过(默认 true): 对方是管理员或私聊白名单用户时自动同意,其余仅记日志留待手动处理"
+    password: false
+  - name: FOX_QQ_BOT_FRIEND_GREET_DELAY
+    description: "自动通过好友请求后延迟多少秒唤醒该私聊,让 AI 主动打一次招呼(默认 60;<=0 不问候;等待期间对方先开口则自动取消)"
+    password: false
+  - name: FOX_QQ_BOT_FRIEND_PROMPT_PATH
+    description: "新好友问候提示词模版路径(默认插件内 prompts/friend.txt,{{Comment}} 为对方验证消息)"
     password: false
   - name: FOX_QQ_BOT_GROUP_ALLOW_ALL_GROUP_USERS
     description: "是否放行群内所有成员触发(默认 true)。设 false 后仅名单内成员+管理员的消息参与触发"
@@ -186,7 +198,7 @@ optional_env:
     description: "收尾提醒/纠正重试上限(默认 3,上限 3)"
     password: false
   - name: FOX_QQ_BOT_GATEWAY_NOTICE_MARKERS
-    description: "gateway 系统通知识别串(JSON 字符串列表,命中即忽略,不算协议违规;默认含 home channel 引导/任务打断/进度心跳)"
+    description: "gateway 系统通知识别串(JSON 字符串列表,命中即忽略,不算协议违规;默认含 home channel 引导/任务打断/进度心跳/后台自我改进(Self-improvement review)与记忆更新等状态条)"
     password: false
   - name: FOX_QQ_BOT_CONTINUE_THINK_MAX
     description: "[CONTINUE_THINK] 续想次数上限(默认 100,<=0 不限;独立计数,每次成功续想重置纠正容错)"
@@ -226,6 +238,12 @@ optional_env:
     password: false
   - name: FOX_QQ_BOT_MEDIA_FILE
     description: "媒体登记表持久化文件(默认 ~/.hermes/fox_bot_data/media.json)"
+    password: false
+  - name: FOX_QQ_BOT_SANDBOX_CONTAINERS
+    description: "沙盒容器取文件(默认 auto): auto=读 Hermes terminal.backend,容器型后端才找沙盒、local/ssh 则关闭;hermes=强制标签过滤;all=全部容器;off/空=只查宿主机;或逗号分隔容器名/ID/通配。AI 沙盒里的文件宿主机看不到时 docker cp 取回"
+    password: false
+  - name: FOX_QQ_BOT_SANDBOX_FETCH_TIMEOUT
+    description: "单次 docker 命令超时秒(默认 15)"
     password: false
   - name: FOX_QQ_BOT_GROUP_PROMPT_PATH
     description: "群聊场景头模版路径(默认插件内 prompts/group.txt)"

@@ -7,6 +7,7 @@
 """
 import logging
 import os
+import re
 import time
 import traceback
 from collections.abc import Callable
@@ -15,6 +16,7 @@ from . import qq_api
 from .config import (
     ADMIN_QQ,
     ALLOWED_GROUPS,
+    ALLOWED_PRIVATE,
     BURST_DELAY,
     CTX_K,
     GROUP_ALLOW_ALL_USERS,
@@ -40,9 +42,11 @@ from .config import (
     TK_DECAY_PROPORTIONAL,
     TK_DECAY_RATIO,
     TK_MAX,
+    TK_MSG_MULT,
     TK_SETTLE_INTERVAL,
     TK_STEP_AT_OTHERS,
     TK_STEP_MENTIONED,
+    TK_TIMER_MULT,
     TRIGGER_QUEUE_LEN,
 )
 from .formatting import make_chat_id
@@ -64,28 +68,32 @@ class AdminCommandHandler:
 
     def __init__(self, engine) -> None:
         self.engine = engine
-        # name -> (允许的参数个数集合, handler)
-        self._commands: dict[str, tuple[frozenset[int], Callable]] = {}
+        # name -> (允许的参数个数集合, handler, 用法提示)
+        self._commands: dict[str, tuple[frozenset[int], Callable, str]] = {}
         self._register_builtin_commands()
 
     def _register_builtin_commands(self) -> None:
-        self.register("new", (0, 2), self._cmd_new)
-        self.register("wake", 1, self._cmd_wake)
-        self.register("status", 0, self._cmd_status)
-        self.register("heat", 0, self._cmd_heat)
+        self.register("new", (0, 2), self._cmd_new,
+                      "/new(刷新当前会话) 或 /new group 群号 / /new private QQ号")
+        self.register("wake", 1, self._cmd_wake, "/wake 群号")
+        self.register("status", 0, self._cmd_status, "/status")
+        self.register("heat", 0, self._cmd_heat, "/heat(仅群聊)")
 
-    def register(self, name: str, arg_count: int | tuple[int, ...], handler: Callable) -> None:
-        """注册命令。arg_count 为允许的参数个数(单个或多选)。
+    def register(self, name: str, arg_count: int | tuple[int, ...], handler: Callable,
+                 usage: str = "") -> None:
+        """注册命令。arg_count 为允许的参数个数(单个或多选);
+        usage 为参数个数不符时回复的用法提示(缺省用 /name)。
         handler: async (event: dict, args: list[str]) -> str。"""
         counts = (arg_count,) if isinstance(arg_count, int) else arg_count
-        self._commands[name.lower()] = (frozenset(counts), handler)
+        self._commands[name.lower()] = (frozenset(counts), handler, usage or f"/{name}")
 
     async def try_handle(self, event: dict, text: str) -> bool:
         """识别成功即拦截执行并回复。
 
         前置: 仅管理员(群聊另需 @机器人,由调用方保证);
-        trim 后以 "/" 开头且命令存在、参数个数正确才算识别成功;
-        识别失败按普通消息继续处理。
+        trim 后以 "/" 开头且命令名存在才算识别成功;
+        参数个数不符 → 仍拦截,回用法提示(手滑的命令不能被 AI 当聊天接走);
+        命令名不存在按普通消息继续处理。
         """
         if str(event.get("user_id")) not in ADMIN_QQ:
             return False
@@ -94,17 +102,21 @@ class AdminCommandHandler:
             return False
         name, args = parts[0][1:].lower(), parts[1:]
         spec = self._commands.get(name)
-        if spec is None or len(args) not in spec[0]:
+        if spec is None:
             return False
-        try:
-            result = await spec[1](event, args)
-        except CommandFailed as e:
-            result = f"/{name} 调用失败: {e}"
-        except Exception as e:
-            logger.exception(f"斜杠命令内部异常 /{name}")
-            tb = traceback.extract_tb(e.__traceback__)
-            loc = f" @ {os.path.basename(tb[-1].filename)}:{tb[-1].lineno}" if tb else ""
-            result = f"/{name} 执行失败(内部异常): {type(e).__name__}: {e}{loc}"
+        counts, handler, usage = spec
+        if len(args) not in counts:
+            result = f"/{name} 参数个数不对。用法: {usage}"
+        else:
+            try:
+                result = await handler(event, args)
+            except CommandFailed as e:
+                result = f"/{name} 调用失败: {e}"
+            except Exception as e:
+                logger.exception(f"斜杠命令内部异常 /{name}")
+                tb = traceback.extract_tb(e.__traceback__)
+                loc = f" @ {os.path.basename(tb[-1].filename)}:{tb[-1].lineno}" if tb else ""
+                result = f"/{name} 执行失败(内部异常): {type(e).__name__}: {e}{loc}"
         try:
             if event.get("message_type") == "group":
                 await qq_api.send_group_msg(int(event["group_id"]), [
@@ -132,6 +144,10 @@ class AdminCommandHandler:
                 st = self.engine.get_group_state(target)
                 tail = f"\n上下文队列保留({len(st.ctx)} 条),下次触发将注入新会话。"
             else:
+                # 与 engine._on_private_message 的放行门一致(管理员 ∪ 私聊白名单):
+                # 名单外的号码收不到任何私聊,建了状态只会成为永久垃圾
+                if target not in ADMIN_QQ and target not in ALLOWED_PRIVATE:
+                    raise CommandFailed(f"QQ {target} 不在私聊白名单内(也非管理员)")
                 st = self.engine.get_private_state(target)
                 tail = ""
         elif event.get("message_type") == "group":
@@ -142,7 +158,12 @@ class AdminCommandHandler:
             ctype, target = "private", str(event["user_id"])
             st = self.engine.get_private_state(target)
             tail = ""
-        st.session_suffix = f"#r{int(time.time())}"
+        # 后缀单调递增: 同一秒内重复 /new 也保证真的换到新会话
+        ts = int(time.time())
+        m = re.fullmatch(r"#r(\d+)", st.session_suffix or "")
+        if m and ts <= int(m.group(1)):
+            ts = int(m.group(1)) + 1
+        st.session_suffix = f"#r{ts}"
         self.engine.save_states()
         return (
             f"已切换到新会话: {make_chat_id(ctype, target, st.session_suffix)}\n"
@@ -157,8 +178,12 @@ class AdminCommandHandler:
             raise CommandFailed(f"群 {gid} 不在白名单内")
         try:
             info = await qq_api.get_group_info(int(gid))
+        except (TimeoutError, ConnectionError) as e:
+            # 超时/断连 ≠ 否定答案: 群状态未知,不能误报"群不存在"引偏排查方向
+            raise CommandFailed(f"NapCat 通信失败({type(e).__name__}: {e}),群状态未知,请稍后重试") from e
         except Exception as e:
-            raise CommandFailed(f"群 {gid} 不存在或机器人不在群内({type(e).__name__})") from e
+            # NapCat 明确返回失败(RuntimeError 携带 retcode)才下"不存在"结论
+            raise CommandFailed(f"群 {gid} 不存在或机器人不在群内({type(e).__name__}: {e})") from e
         st = self.engine.get_group_state(gid)
         if st.group_name is None:
             st.group_name = str((info or {}).get("group_name") or gid)
@@ -190,21 +215,31 @@ class AdminCommandHandler:
         st = self.engine.get_group_state(group_id)
         now = time.monotonic()
         base_rate = heat_rate(st, now)
-        rate = base_rate + st.tk  # 概率实际用的是 热度速率 + 临时热度 TK
+        # 与 engine 的触发公式严格一致: 各渠道用各自的 TK 乘数
+        # (_timer_loop: tk×TK_TIMER_MULT;_on_group_message: tk×TK_MSG_MULT)
+        timer_rate = base_rate + st.tk * TK_TIMER_MULT
+        msg_rate = base_rate + st.tk * TK_MSG_MULT
         heat_mode = (
             f"累计 C(系数 {HEAT_ACC_RATIO}, 上限 {HEAT_MAX:g}" + ("" if HEAT_MAX > 0 else "=不设限")
             + f", 空闲 {HEAT_DECAY_IDLE:.0f}s 后每秒×{HEAT_DECAY_FACTOR})"
         ) if HEAT_ACCUMULATE else "瞬时速率"
         tk_mode = ("比例×" + f"{TK_DECAY_RATIO}") if TK_DECAY_PROPORTIONAL else ("固定-" + f"{TK_DECAY_FIXED:g}")
-        timer_p = heat_prob(rate, TIMER_PROB_LO, TIMER_PROB_HI, TIMER_PROB_CAP, TIMER_PROB_THRESHOLD, TIMER_PROB_CURVE)
-        msg_p = heat_prob(rate, MSG_PROB_LO, MSG_PROB_HI, MSG_PROB_CAP, MSG_PROB_THRESHOLD, MSG_PROB_CURVE)
+        timer_p = heat_prob(timer_rate, TIMER_PROB_LO, TIMER_PROB_HI, TIMER_PROB_CAP, TIMER_PROB_THRESHOLD, TIMER_PROB_CURVE)
+        msg_p = heat_prob(msg_rate, MSG_PROB_LO, MSG_PROB_HI, MSG_PROB_CAP, MSG_PROB_THRESHOLD, MSG_PROB_CURVE)
+        # 定时渠道特有守卫: 命中时本轮实际不触发,概率数字只是守卫解除后的值
+        if not st.ctx:
+            timer_note = " [实际跳过: 无上下文]"
+        elif st.ctx_seq == st.last_wake_seq:
+            timer_note = " [实际跳过: 会话无变化]"
+        else:
+            timer_note = ""
         return (
-            f"热度: {rate:.2f} = 基础 {base_rate:.2f} [{heat_mode}] + 临时 TK {st.tk:.1f}"
+            f"热度基础: {base_rate:.2f} [{heat_mode}] + 临时 TK {st.tk:.1f}"
             f"(步进 被@{TK_STEP_MENTIONED:g}/@别人{TK_STEP_AT_OTHERS:g}, 上限{TK_MAX:g},"
             f" 每{TK_SETTLE_INTERVAL:g}s {tk_mode})\n"
             f"瞬时速率: {instant_rate(st, now):.1f} 条/分钟\n"
-            f"定时触发概率: {timer_p:.2f} (曲线: {TIMER_PROB_CURVE})\n"
-            f"消息触发概率: {msg_p:.2f} (曲线: {MSG_PROB_CURVE})\n"
+            f"定时触发概率: {timer_p:.2f} @热度 {timer_rate:.2f}(TK×{TK_TIMER_MULT:g}, 曲线: {TIMER_PROB_CURVE}){timer_note}\n"
+            f"消息触发概率: {msg_p:.2f} @热度 {msg_rate:.2f}(TK×{TK_MSG_MULT:g}, 曲线: {MSG_PROB_CURVE})\n"
             f"关键词: {len(KEYWORD_TRIGGERS)} 个\n"
             f"成员放行: {'全员' if GROUP_ALLOW_ALL_USERS else f'名单 {len(GROUP_ALLOWED_USERS)} 人 + 管理员'}\n"
             f"上下文队列: {len(st.ctx)}/{CTX_K} (R={st.since})\n"

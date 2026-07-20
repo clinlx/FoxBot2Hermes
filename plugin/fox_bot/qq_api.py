@@ -23,8 +23,11 @@ seg_at("all") 为 @全体成员,受群配额限制,
 可先用 get_group_at_all_remain(gid) 查询剩余次数。
 """
 
+import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
+
+logger = logging.getLogger("fox_bot.api")
 
 # 延迟导入避免循环依赖
 _DEBUG_API = False

@@ -17,10 +17,10 @@ import logging
 import os
 from typing import Any
 
-from . import qq_api
+from . import qq_api, sandboxfs
 from .emoticons import resolve_emoticon
 from .mediastore import seg_marker, store as media_store
-from .config import ALLOWED_GROUPS, ALLOWED_PRIVATE, DEBUG_REPLY, RESOLVE_AT
+from .config import ADMIN_QQ, ALLOWED_GROUPS, ALLOWED_PRIVATE, DEBUG_REPLY, RESOLVE_AT
 from .formatting import (
     ensure_reply_at,
     is_turn_end,
@@ -28,6 +28,7 @@ from .formatting import (
     parse_chat_id,
     prepare_outgoing,
     resolve_at,
+    split_end_marker,
 )
 
 logger = logging.getLogger("fox_bot.tools")
@@ -71,7 +72,10 @@ def _resolve_target(channel_type: str | None, target_id: str | None,
         if ALLOWED_GROUPS and target_id not in ALLOWED_GROUPS:
             return {"error": f"群 {target_id} 不在许可范围"}
     elif channel_type == "private":
-        if ALLOWED_PRIVATE and target_id not in ALLOWED_PRIVATE:
+        # 与入站门(engine._on_private_message)保持一致: 管理员永远允许私聊,
+        # 否则能收到管理员消息却无法回信(工具/碎碎念代发全被自己拦下)
+        if ALLOWED_PRIVATE and target_id not in ALLOWED_PRIVATE \
+                and target_id not in ADMIN_QQ:
             return {"error": f"用户 {target_id} 不在许可范围"}
     else:
         return {"error": f"channel_type 无效: {channel_type}(应为 group/private)"}
@@ -103,6 +107,10 @@ async def tool_send_message(args: dict, context: dict | None = None) -> dict:
         if emo_result is not None and "error" in emo_result:
             out["emoticon_error"] = emo_result["error"]
         return out
+
+    # 正文末尾单独成行的 [NO_REPLY]: 与裸回复路径(split_end_marker)对齐——
+    # 剥掉标记正常发送正文,发完顺带结束回合,标记本身绝不发进 QQ
+    content, end_after_send = split_end_marker(content)
 
     resolved = _resolve_target(args.get("channel_type"), args.get("target_id"),
                                current_chat_id)
@@ -228,7 +236,14 @@ async def tool_send_message(args: dict, context: dict | None = None) -> dict:
             result["emoticon_error"] = emo_result["error"]
         else:
             result["emoticon_sent"] = True
-    
+
+    # 正文携带的末行 [NO_REPLY]: 发送成功才结束回合(失败时保留回合让 AI 重试)
+    if end_after_send:
+        logger.info(f"[send] 正文末行携带 NO_REPLY → 发送成功,结束回合 chat={current_chat_id!r}")
+        if _engine is not None:
+            _engine.mark_turn_end(current_chat_id)
+        result["turn_ended"] = True
+
     return result
 
 
@@ -293,8 +308,13 @@ async def _send_emoticon(ctype: str, target: str, emoticon: str) -> dict:
     # resolved_emo 是本地路径或 URL,走 tool_send_image 的逻辑
     logger.info(f"[send_emoticon] → {ctype}:{target} emoticon={emoticon} "
                 f"resolved={resolved_emo[:60] if len(resolved_emo) > 60 else resolved_emo}")
+    resolved_emo = await _swap_internal(resolved_emo)
+    # 本地路径预检: 宿主机不可见时先从沙盒容器取回(与 send_image 同一兜底链)
+    prepared = await _prepare_local(resolved_emo)
+    if isinstance(prepared, dict):
+        return {"error": f"表情发送失败: {prepared['error']}"}
+    resolved_emo, cleanup, _note = prepared
     try:
-        resolved_emo = await _swap_internal(resolved_emo)
         bridged = _bridge_local(resolved_emo)
         img = bridged if bridged else resolved_emo
         data = await _send(ctype, target, [qq_api.seg_image(img)])
@@ -317,6 +337,12 @@ async def _send_emoticon(ctype: str, target: str, emoticon: str) -> dict:
                     return {"error": f"表情发送失败(含 base64 重试): {type(e2).__name__}: {e2}"}
         logger.exception(f"[send_emoticon] 发送失败 emoticon={emoticon}")
         return {"error": f"表情发送失败: {type(e).__name__}: {e}"}
+    finally:
+        if cleanup:
+            try:
+                os.remove(cleanup)
+            except OSError:
+                pass
 
 
 
@@ -367,6 +393,74 @@ def _send_fail_hint(source: str) -> str:
     return ""
 
 
+def _is_local_path(source: str) -> bool:
+    """是否本地文件路径形态(而非 URL / base64)。"""
+    low = source.lower()
+    if low.startswith(("http://", "https://", "base64://")):
+        return False
+    p = source[7:] if low.startswith("file://") else source
+    return p.startswith("/") or (len(p) > 2 and p[1] == ":" and p[2] in ("\\", "/"))
+
+
+# 临时目录前缀: 这类目录常是 tmpfs 或容器独立挂载,docker cp 取不到
+_TEMP_DIR_PREFIXES = ("/tmp/", "/var/tmp/", "/dev/shm/")
+
+
+def _in_temp_dir(path: str) -> bool:
+    """路径是否落在临时目录下(容器取回易失败,需提醒 AI 换目录)。"""
+    return path.startswith(_TEMP_DIR_PREFIXES)
+
+
+async def _prepare_local(source: str) -> tuple[str, str | None, str | None] | dict:
+    """本地路径预检 —— 信任边界即沙盒边界(防越权读宿主机文件)。
+
+    AI 跑在容器沙盒里时,它给的路径**只在容器内解析**,绝不读宿主机
+    (否则 AI 传 /root/.hermes/.env、/etc/shadow 等就能让插件把宿主机的
+    敏感文件外发 —— confused deputy 逃逸)。据 sandbox 是否启用分两种信任模式:
+
+    - 沙盒**开启**(配了容器 + 有 docker): AI 与插件文件系统隔离,
+      路径一律 docker cp 从容器取,**跳过宿主机 os.path.isfile**;
+    - 沙盒**关闭**(local backend, AI 终端就在宿主机): 二者同一文件系统,
+      此时读宿主机路径才是合理的(用户显式选了无隔离)。
+
+    返回 (可发送 source, 待清理临时文件|None, 附注|None);
+    失败返回 {"error": ...}。URL/base64 等非本地形态原样放行。
+    """
+    if not _is_local_path(source):
+        return source, None, None
+    p = source[7:] if source.lower().startswith("file://") else source
+
+    if sandboxfs.enabled():
+        # 沙盒模式: 只从容器取,宿主机路径对 AI 越权,一律不读宿主机
+        tmp, tried = await sandboxfs.fetch(p)
+        if tmp:
+            note = f"已从沙盒容器取回({sandboxfs.last_hit()})"
+            logger.info(f"[sandbox] {p} → {tmp}")
+            return tmp, tmp, note
+        if tried:
+            where = f"从沙盒容器取回失败(依次试了: {', '.join(tried)}),均无此文件"
+        else:
+            where = "但没有匹配到可取回的运行中容器"
+        # 临时目录常是 tmpfs/独立挂载,docker cp 取不到 —— 专门提示换目录
+        tmp_hint = ""
+        if _in_temp_dir(p):
+            tmp_hint = (f"\n注意: {p} 在临时目录下,这类目录(tmpfs/独立挂载)"
+                        "往往无法从容器外取回。请把文件生成到工作目录(如 "
+                        "~/ 或当前 cwd)而不是 /tmp、/var/tmp、/dev/shm。")
+        return {"error": (
+            f"文件不存在: {p} 在你的执行环境里取不到,{where}。"
+            "请确认路径正确,或改用公网 URL 发送,"
+            "或在你的终端里把文件编码为 base64 后以 base64://<编码> 传入本工具。"
+            + tmp_hint)}
+
+    # 无沙盒(local backend): AI 与插件同一文件系统,直读宿主机是合理的
+    if os.path.isfile(p):
+        return source, None, None
+    return {"error": (
+        f"文件不存在: {p} 找不到。请确认路径正确,或改用公网 URL / "
+        "base64://<编码> 发送。")}
+
+
 async def tool_send_image(args: dict, context: dict | None = None) -> dict:
     """发送图片(URL / 本地路径 / base64://);本地路径失败自动经媒体桥重试。"""
     resolved = _resolve_target(args.get("channel_type"), args.get("target_id"),
@@ -379,6 +473,13 @@ async def tool_send_image(args: dict, context: dict | None = None) -> dict:
         return {"error": "image 为空"}
     image = await _swap_internal(image)
     caption = str(args.get("caption") or "").strip()
+
+    # 本地路径预检: 宿主机不可见时先尝试沙盒容器取回;彻底找不到
+    # 直接返回独立的"文件不存在"报告(不再把裸路径丢给 NapCat 撞墙)
+    prepared = await _prepare_local(image)
+    if isinstance(prepared, dict):
+        return prepared
+    image, cleanup, note = prepared
 
     async def _try(img: str):
         message: list = [qq_api.seg_image(img)]
@@ -412,9 +513,18 @@ async def tool_send_image(args: dict, context: dict | None = None) -> dict:
                 hint = _send_fail_hint(image)
                 return {"error": f"发送失败: {type(e).__name__}: {e}"
                                  + (f"({hint})" if hint else "")}
+    finally:
+        if cleanup:
+            try:
+                os.remove(cleanup)
+            except OSError:
+                pass
     if ctype == "group":
         _note_sent(ctype, target, [f"[图片]{(' ' + caption) if caption else ''}"])
-    return {"success": True, "message_id": (data or {}).get("message_id")}
+    result = {"success": True, "message_id": (data or {}).get("message_id")}
+    if note:
+        result["note"] = note
+    return result
 
 
 async def tool_send_file(args: dict, context: dict | None = None) -> dict:
@@ -429,6 +539,11 @@ async def tool_send_file(args: dict, context: dict | None = None) -> dict:
     if not file or not name:
         return {"error": "file/name 不能为空"}
     file = await _swap_internal(file)
+
+    prepared = await _prepare_local(file)
+    if isinstance(prepared, dict):
+        return prepared
+    file, cleanup, note = prepared
 
     async def _try(f: str):
         if ctype == "group":
@@ -460,9 +575,18 @@ async def tool_send_file(args: dict, context: dict | None = None) -> dict:
             else:
                 logger.exception("fox_qq_send_file 发送失败")
                 return {"error": f"发送失败: {type(e).__name__}: {e}"}
+    finally:
+        if cleanup:
+            try:
+                os.remove(cleanup)
+            except OSError:
+                pass
     if ctype == "group":
         _note_sent(ctype, target, [f"[文件] {name}"])
-    return {"success": True, "name": name}
+    result = {"success": True, "name": name}
+    if note:
+        result["note"] = note
+    return result
 
 
 def _history_line(msg: dict) -> str:

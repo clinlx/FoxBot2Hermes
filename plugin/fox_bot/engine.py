@@ -41,6 +41,7 @@ from .config import (
     DEBUG_PROMPT,
     DEBUG_TRIGGER,
     DEFAULT_CRON_PROMPT,
+    DEFAULT_FRIEND_PROMPT,
     DEFAULT_GROUP_PROMPT,
     DEFAULT_KEYWORD_PROMPT,
     DEFAULT_PRIVATE_PROMPT,
@@ -50,6 +51,9 @@ from .config import (
     ERROR_NOTIFY_ADMIN,
     ERROR_NOTIFY_COOLDOWN,
     ERROR_NOTIFY_GROUP,
+    FRIEND_AUTO_ACCEPT,
+    FRIEND_GREET_DELAY,
+    FRIEND_PROMPT_PATH,
     GROUP_ALLOW_ALL_USERS,
     GROUP_ALLOWED_USERS,
     GROUP_PROMPT_PATH,
@@ -337,6 +341,7 @@ def check_prompt_files() -> None:
         ("关键词提示词模版", KEYWORD_PROMPT_PATH),
         ("唤醒提示词模版", WAKE_PROMPT_PATH),
         ("定时任务提示词模版", CRON_PROMPT_PATH),
+        ("新好友问候提示词模版", FRIEND_PROMPT_PATH),
     ):
         if path and not os.path.isfile(path):
             _warn_prompt_fallback(path, "文件不存在", label)
@@ -373,6 +378,12 @@ def load_cron_prompt(body: str) -> str:
     """定时任务提示词: {{CronBody}} 填入该触发项配置的 prompt。"""
     return render_template(_load_prompt(CRON_PROMPT_PATH, DEFAULT_CRON_PROMPT),
                            {"CronBody": body})
+
+
+def load_friend_prompt(comment: str) -> str:
+    """新好友问候提示词: {{Comment}} 填入对方申请时的验证消息。"""
+    return render_template(_load_prompt(FRIEND_PROMPT_PATH, DEFAULT_FRIEND_PROMPT),
+                           {"Comment": comment.strip() or "(空)"})
 
 
 # ---------------------------------------------------------------------------
@@ -620,6 +631,10 @@ class QQEngine:
         self._members_dirty: bool = False
         # 定时任务(start 时经 validate_cron_tasks 校验后填入)
         self.cron_tasks: list[dict] = []
+        # 已处理过的好友请求 flag(防 NapCat 重复上报导致重复通过/重复问候)
+        self._friend_flags_seen: set[str] = set()
+        # 未触发的新好友问候定时器: user_id -> Task(对方先开口即取消)
+        self._greet_tasks: dict[str, asyncio.Task] = {}
 
     # ---- 生命周期 ----
 
@@ -654,6 +669,11 @@ class QQEngine:
         for t in self._tasks:
             t.cancel()
         self._tasks.clear()
+        # 未触发的新好友问候定时器
+        for t in self._greet_tasks.values():
+            if not t.done():
+                t.cancel()
+        self._greet_tasks.clear()
         # 每个聊天的 worker 也要取消,避免孤儿任务
         for state in (*self.group_states.values(), *self.private_states.values()):
             if state.worker is not None and not state.worker.done():
@@ -1191,6 +1211,9 @@ class QQEngine:
         if event.get("self_id"):
             self.self_id = str(event["self_id"])
         post_type = event.get("post_type")
+        if post_type == "request":
+            await self._on_request(event)
+            return
         if post_type != "message":
             if DEBUG_TRIGGER:
                 logger.info(f"[event] 非 message 事件,忽略 post_type={post_type}")
@@ -1322,6 +1345,19 @@ class QQEngine:
                 return
             pst.last_accepted = now
 
+            # 新好友问候: 对方先开口且本条消息即将入队(AI 会顺着它回)→
+            # 取消未触发的问候定时器,已入队未处理的问候事件一并移除。
+            # 纯图片/表情这类不进管线的消息不算"开口",问候仍会发出,
+            # 否则会出现"对方发了表情包、问候也被取消、双方沉默"的死局。
+            greet_task = self._greet_tasks.pop(user_id, None)
+            if greet_task is not None and not greet_task.done():
+                greet_task.cancel()
+                logger.info(f"新好友先发来消息,取消预定问候 user={user_id}")
+            if any(p.get("type") == "friend_greet" for p in pst.pending):
+                pst.pending = deque(p for p in pst.pending
+                                    if p.get("type") != "friend_greet")
+                logger.info(f"新好友先发来消息,移除已入队的问候 user={user_id}")
+
             # 私聊也构造伪成员表(只有对方和机器人),用于 format_line 把 @QQ 转名字
             nickname = (event.get("sender") or {}).get("nickname") or user_id
             fake_members = [
@@ -1341,6 +1377,78 @@ class QQEngine:
             exc_text = traceback.format_exc()
             logger.exception(f"私聊消息处理异常 user={user_id}")
             await self._notify_error(f"private-{user_id}", "私聊消息处理异常", exc_text)
+
+    # ---- 好友请求自动通过(触发式逻辑,非 AI 工具) ----
+
+    async def _on_request(self, event: dict) -> None:
+        """post_type=request 入口: 好友请求按白名单自动通过。
+
+        对方是管理员或私聊白名单用户 → set_friend_add_request 同意,并延迟
+        FRIEND_GREET_DELAY 秒唤醒该私聊让 AI 主动打一次招呼;其余请求
+        (白名单外/加群请求)仅记日志,留待 QQ 客户端手动处理。
+        """
+        rtype = event.get("request_type")
+        user_id = str(event.get("user_id", ""))
+        comment = str(event.get("comment") or "").strip()
+        if rtype != "friend":
+            logger.info(f"收到非好友请求(request_type={rtype}),不自动处理 user={user_id}")
+            return
+        if not FRIEND_AUTO_ACCEPT:
+            logger.info(f"好友请求 user={user_id} comment={comment!r}: "
+                        "自动通过已关闭,留待手动处理")
+            return
+        if user_id not in ADMIN_QQ and user_id not in ALLOWED_PRIVATE:
+            logger.info(f"好友请求 user={user_id} comment={comment!r}: "
+                        "非管理员/私聊白名单,不自动通过")
+            return
+        flag = str(event.get("flag") or "")
+        if not flag:
+            logger.warning(f"好友请求缺少 flag,无法自动通过 user={user_id}")
+            return
+        if flag in self._friend_flags_seen:
+            logger.info(f"好友请求重复上报,忽略 user={user_id}")
+            return
+        self._friend_flags_seen.add(flag)
+        since = time.monotonic()   # 早于 API await: 通过瞬间对方抢先开口也算"已开口"
+        try:
+            await qq_api.set_friend_add_request(flag, True)
+        except Exception as e:
+            self._friend_flags_seen.discard(flag)   # 失败时允许下次上报重试
+            logger.warning(f"自动通过好友请求失败 user={user_id}: {e}")
+            return
+        greet = FRIEND_GREET_DELAY > 0
+        logger.info(f"已自动通过好友请求 user={user_id} comment={comment!r}"
+                    + (f",{FRIEND_GREET_DELAY:g}s 后主动问候(对方先开口则取消)" if greet else ""))
+        if greet:
+            old = self._greet_tasks.pop(user_id, None)
+            if old is not None and not old.done():
+                old.cancel()
+            self._greet_tasks[user_id] = asyncio.create_task(
+                self._friend_greet_later(user_id, comment, since))
+
+    async def _friend_greet_later(self, user_id: str, comment: str, since: float) -> None:
+        """通过好友请求后,等一会儿(好友关系落定)再唤醒私聊主动问候一次。
+
+        等待期间对方先发来消息则不问候: 定时器由 _on_private_message 直接取消;
+        此处再按 last_accepted 兜底核对一次,覆盖取消来不及的竞态窗口。
+        """
+        try:
+            await asyncio.sleep(FRIEND_GREET_DELAY)
+            existing = self.private_states.get(user_id)
+            if existing is not None and existing.last_accepted >= since:
+                logger.info(f"新好友已先开口,取消预定问候 user={user_id}")
+                return
+            pst = self.get_private_state(user_id)
+            if any(p.get("type") == "friend_greet" for p in pst.pending):
+                return
+            self._queue_push(pst, {"type": "friend_greet", "comment": comment})
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(f"好友问候调度异常 user={user_id}")
+        finally:
+            if self._greet_tasks.get(user_id) is asyncio.current_task():
+                self._greet_tasks.pop(user_id, None)
 
     # ---- 事件处理(worker 消费) ----
 
@@ -1456,16 +1564,17 @@ class QQEngine:
                     logger.exception("错误提示发送失败")
 
     async def _process_private(self, user_id: str, pst: PrivateState, ev: dict) -> None:
-        if ev.get("type") == "cron":
-            # 定时任务: 无入站消息,场景头 + cron 提示词直接唤醒
+        if ev.get("type") in ("cron", "friend_greet"):
+            # 自发唤醒(定时任务/新好友问候): 无入站消息,场景头 + 专用提示词
             nickname = user_id
             try:
                 info = await qq_api.get_stranger_info(int(user_id))
                 nickname = str((info or {}).get("nickname") or user_id)
             except Exception:
-                logger.debug(f"获取昵称失败,cron 私聊用 QQ 号代替 user={user_id}")
+                logger.debug(f"获取昵称失败,私聊唤醒用 QQ 号代替 user={user_id}")
             scene = private_scene_prompt(user_id, nickname)
-            body = load_cron_prompt(ev["prompt"])
+            body = (load_cron_prompt(ev["prompt"]) if ev["type"] == "cron"
+                    else load_friend_prompt(ev.get("comment") or ""))
         else:
             scene = private_scene_prompt(user_id, ev["nickname"])
             # 私聊也用 format_line 把 @QQ 转成 @名字
