@@ -28,9 +28,8 @@ import logging
 import os
 import shutil
 import tempfile
-import uuid
 
-from .config import OCR_BACKEND, OCR_TESSERACT_LANG, SANDBOX_FETCH_TIMEOUT, TMP_DIR
+from .config import OCR_BACKEND, OCR_TESSERACT_LANG, TMP_DIR
 
 logger = logging.getLogger("fox_bot.ocr")
 
@@ -75,11 +74,15 @@ def available() -> tuple[bool, str]:
 # tesseract 后端(默认): CLI 子进程,零常驻内存
 # ---------------------------------------------------------------------------
 
-async def _run_cmd(*argv: str, timeout: float = _TESS_TIMEOUT) -> tuple[int, bytes, str]:
+async def _run_cmd(*argv: str, input_data: bytes | None = None,
+                   timeout: float = _TESS_TIMEOUT) -> tuple[int, bytes, str]:
     proc = await asyncio.create_subprocess_exec(
-        *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        *argv,
+        stdin=asyncio.subprocess.PIPE if input_data is not None else None,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     try:
-        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        out, err = await asyncio.wait_for(
+            proc.communicate(input=input_data), timeout=timeout)
     except asyncio.TimeoutError:
         proc.kill()
         return 124, b"", "timeout"
@@ -91,25 +94,22 @@ def _clean_lines(text: str) -> list[str]:
 
 
 async def _tesseract_host(data: bytes) -> list[str]:
-    os.makedirs(TMP_DIR, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix="fox_ocr_", suffix=".png", dir=TMP_DIR)
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(data)
-        rc, out, err = await _run_cmd(
-            "tesseract", tmp, "stdout", "-l", OCR_TESSERACT_LANG)
-        if rc != 0:
-            raise RuntimeError(f"tesseract 失败({rc}): {err[:200]}")
-        return _clean_lines(out.decode("utf-8", "replace"))
-    finally:
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
+    """本机模式: 图片经 stdin 管给 tesseract,零落盘。"""
+    rc, out, err = await _run_cmd(
+        "tesseract", "stdin", "stdout", "-l", OCR_TESSERACT_LANG,
+        input_data=data)
+    if rc != 0:
+        raise RuntimeError(f"tesseract 失败({rc}): {err[:200]}")
+    return _clean_lines(out.decode("utf-8", "replace"))
 
 
 async def _tesseract_sandbox(data: bytes) -> list[str]:
-    """沙盒模式: 图片 cp 进容器临时目录,在容器内跑 tesseract,完毕即删。"""
+    """沙盒模式: 图片经 stdin 管进容器,tesseract 从 stdin 读,零落盘。
+
+    不用 docker cp 落容器文件: Hermes 沙盒的 /tmp 是 tmpfs 独立挂载,
+    docker cp 写的是被遮蔽的镜像层路径,容器内进程根本看不到(实机踩坑
+    证实);其他目录又会污染 AI 的工作区。stdin 直通两个问题都没有。
+    """
     from . import sandboxfs
     names, sel_err = await sandboxfs._pick_candidates()
     if sel_err:
@@ -117,34 +117,16 @@ async def _tesseract_sandbox(data: bytes) -> list[str]:
     if not names:
         raise RuntimeError("未发现沙盒容器")
     container = names[0]
-    remote = f"/tmp/fox_ocr_{uuid.uuid4().hex}.png"
-    os.makedirs(TMP_DIR, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix="fox_ocr_", suffix=".png", dir=TMP_DIR)
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(data)
-        rc, _, err = await _run_cmd("docker", "cp", tmp, f"{container}:{remote}",
-                                    timeout=SANDBOX_FETCH_TIMEOUT)
-        if rc != 0:
-            raise RuntimeError(f"图片放入容器失败: {err[:200]}")
-    finally:
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
-    try:
-        rc, out, err = await _run_cmd(
-            "docker", "exec", container,
-            "tesseract", remote, "stdout", "-l", OCR_TESSERACT_LANG)
-        if rc != 0:
-            raise RuntimeError(
-                f"容器内 tesseract 失败({rc}): {err[:200]};"
-                "如未安装可在终端执行 apt install -y tesseract-ocr "
-                "tesseract-ocr-chi-sim 后重试")
-        return _clean_lines(out.decode("utf-8", "replace"))
-    finally:
-        await _run_cmd("docker", "exec", container, "rm", "-f", remote,
-                       timeout=SANDBOX_FETCH_TIMEOUT)
+    rc, out, err = await _run_cmd(
+        "docker", "exec", "-i", container,
+        "tesseract", "stdin", "stdout", "-l", OCR_TESSERACT_LANG,
+        input_data=data)
+    if rc != 0:
+        raise RuntimeError(
+            f"容器内 tesseract 失败({rc}): {err[:200]};"
+            "如未安装可在终端执行 apt install -y tesseract-ocr "
+            "tesseract-ocr-chi-sim 后重试")
+    return _clean_lines(out.decode("utf-8", "replace"))
 
 
 # ---------------------------------------------------------------------------
