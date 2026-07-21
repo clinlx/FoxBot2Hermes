@@ -88,6 +88,7 @@ from .config import (
     PROACTIVE_PROMPT_PATH,
     PROCESS_DELAY,
     PROTOCOL_RETRY,
+    QUEUE_MERGE,
     SHARED_COOLDOWN,
     STATE_FILE,
     STATE_SAVE_INTERVAL,
@@ -157,6 +158,9 @@ class ChatState:
         # 回合轨迹: 本轮的 (角色, 摘要) 条目,超时报错时随通知输出。
         # 只记 USER 递交/AI 回答/工具调用及成败,不含 AI 思考与工具详细输出。
         self.turn_trace: deque[str] = deque(maxlen=TIMEOUT_TRACE_MAX_ITEMS)
+        # 待转达的系统提醒: 本回合来不及说的(如回合末代发剥了引用标记),
+        # 下一回合注入时置顶带给 AI(阅后即焚)
+        self.pending_sys_notes: list[str] = []
 
 
 class GroupState(ChatState):
@@ -190,6 +194,11 @@ class PrivateState(ChatState):
     def __init__(self) -> None:
         super().__init__()
         self.last_accepted: float = 0.0
+        # 消息缓冲(与群聊 ctx 同构): 消息一律先入列,pending 只放轻量
+        # "有新消息"标记(去重)——无论 AI 多忙,CTX_K 条以内一条不丢。
+        self.ctx: deque[str] = deque(maxlen=CTX_K)
+        self.since: int = 0
+        self.nickname: str = ""   # 最近一次消息的昵称(场景头用)
 
 
 # ---------------------------------------------------------------------------
@@ -654,6 +663,11 @@ class QQEngine:
     async def start(self) -> None:
         check_prompt_files()
         self._clean_tmp_dir()  # 清空上次运行残留的临时文件(取消/崩溃遗留)
+        # 时钟自检(后台,不阻塞启动): 时钟漂移会让 NapCat 送达确认失灵,
+        # 每次发送白等 ~30s 且无报错——超阈值时告警并通知管理员
+        from . import clockcheck
+        asyncio.create_task(clockcheck.check_at_startup(
+            notify=lambda brief, detail: self._notify_error("clock", brief, detail)))
         self.load_states()
         self.load_members()  # 加载持久化的成员缓存
         await media_store.start()
@@ -764,10 +778,13 @@ class QQEngine:
                 "group_name": st.group_name,
                 "session_suffix": st.session_suffix,
             }
-        privates = {
-            uid: {"session_suffix": pst.session_suffix}
-            for uid, pst in self.private_states.items() if pst.session_suffix
-        }
+        privates = {}
+        for uid, pst in self.private_states.items():
+            if not (pst.session_suffix or pst.ctx):
+                continue
+            privates[uid] = {"session_suffix": pst.session_suffix,
+                             "ctx": list(pst.ctx), "since": pst.since,
+                             "nickname": pst.nickname}
         return {"version": 1, "saved_wall": time.time(), "groups": groups, "privates": privates}
 
     def save_states(self) -> None:
@@ -815,7 +832,14 @@ class QQEngine:
             st.session_suffix = str(g.get("session_suffix", ""))
             restored += 1
         for uid, p in data.get("privates", {}).items():
-            self.private_states.setdefault(uid, PrivateState()).session_suffix = str(p.get("session_suffix", ""))
+            pst = self.private_states.setdefault(uid, PrivateState())
+            pst.session_suffix = str(p.get("session_suffix", ""))
+            pst.ctx = deque(p.get("ctx", []), maxlen=CTX_K)
+            pst.since = int(p.get("since", 0))
+            pst.nickname = str(p.get("nickname", ""))
+            if pst.ctx:
+                # 停机期间的未回应消息: 重启后补一个触发标记,消息不烂在缓冲里
+                self._queue_push(pst, {"type": "private"})
         if restored:
             logger.info(f"已从 {STATE_FILE} 恢复 {restored} 个群的状态(停机 {downtime:.0f}s)")
 
@@ -904,7 +928,21 @@ class QQEngine:
     def _queue_push(self, state: ChatState, ev: dict) -> None:
         if len(state.pending) >= TRIGGER_QUEUE_LEN:
             dropped = state.pending.popleft()
-            logger.warning(f"触发队列已满,丢弃最旧事件: {dropped['type']}")
+            # 丢弃日志带上内容摘要,事后可追责"丢了谁的什么话"
+            detail = _trace_snip(str(dropped.get("prompt") or dropped.get("text")
+                                     or dropped.get("line") or ""), 80)
+            logger.warning(f"触发队列已满,丢弃最旧事件: {dropped['type']}"
+                           + (f" msg_id={dropped['message_id']}" if dropped.get("message_id") else "")
+                           + (f" 内容={detail!r}" if detail else ""))
+            # mention 被挤掉时把 @ 消息降级回上下文队列,内容不蒸发
+            # (AI 下回合仍能看到这条 @;只是失去"绝对触发"待遇)
+            if dropped.get("type") == "mention" and isinstance(state, GroupState):
+                line = (f"[msg_id#{dropped.get('message_id')}]"
+                        f"[{dropped.get('nick')}(qq_id@{dropped.get('user_id', '')})]: "
+                        f"@你: {dropped.get('prompt', '')}")
+                state.ctx.append(line)
+                state.since += 1
+                state.ctx_seq += 1
         state.pending.append(ev)
         state.wake.set()
         if DEBUG_CTX:
@@ -948,7 +986,15 @@ class QQEngine:
                 await asyncio.sleep(wait)
             if not state.pending:
                 continue
-            ev = state.pending.popleft()
+            if QUEUE_MERGE and len(state.pending) > 1:
+                # 队列合并: 一次性取完剩余事件,合成一个 merged 事件走一个回合
+                evs = list(state.pending)
+                state.pending.clear()
+                ev = {"type": "merged", "events": evs}
+                logger.info(f"队列合并取件 chat={label} 合并 {len(evs)} 个事件: "
+                            + ",".join(e.get("type", "?") for e in evs))
+            else:
+                ev = state.pending.popleft()
             state.processing = True
             try:
                 await process(ev)
@@ -1010,6 +1056,11 @@ class QQEngine:
 
     async def _run_turn(self, chat_id: str, state: ChatState, text: str) -> None:
         """递交一轮给 agent 并等待回合结束(NO_REPLY/重试耗尽/超时)。"""
+        # 上回合攒下的系统提醒(代发时剥了误写引用标记等): 置顶转达,阅后即焚
+        if state.pending_sys_notes:
+            notes = "\n".join(f"<系统提醒: {n}>" for n in state.pending_sys_notes)
+            state.pending_sys_notes.clear()
+            text = f"{notes}\n\n{text}"
         state.turn_retries = 0
         state.turn_continues = 0
         state.turn_tool_called = False
@@ -1063,6 +1114,13 @@ class QQEngine:
         else:
             logger.info(f"碎碎念已自动代发 chat={chat_id}: {body[:120]!r}")
             state.turn_trace.append(f"AI(已代发): {_trace_snip(body)}")
+            # 代发经出站管线产生的告警(误写引用标记被剥/假@不存在等):
+            # 正文通道没有"返回值"能给 AI 看,记入待转达,下一回合置顶提醒
+            if isinstance(result, dict):
+                for key in ("reply_mark_warning", "warning"):
+                    note = result.get(key)
+                    if note and note not in state.pending_sys_notes:
+                        state.pending_sys_notes.append(str(note))
 
     async def on_agent_reply(self, chat_id: str, content: str) -> None:
         """adapter.send() 的实现: 回合结束协议校验点。
@@ -1257,6 +1315,12 @@ class QQEngine:
         if post_type == "request":
             await self._on_request(event)
             return
+        if post_type == "notice":
+            # 撤回 → 上下文追加一条撤回事件行(不改旧行,AI 下次注入/查历史
+            # 即知有人撤回了哪条)。AI 引用已撤回消息时发送侧自会降级
+            # (去掉无效引用照发内容),两层互补。其余 notice 静默忽略
+            self._on_recall(event)
+            return
         if post_type != "message":
             if DEBUG_TRIGGER:
                 logger.info(f"[event] 非 message 事件,忽略 post_type={post_type}")
@@ -1268,6 +1332,54 @@ class QQEngine:
             await self._on_private_message(event)
         else:
             logger.warning(f"未知 message_type,忽略: {mtype} keys={sorted(event.keys())}")
+
+    def _on_recall(self, event: dict) -> None:
+        """撤回通知 → 对应会话的 ctx 追加一条撤回事件行。
+
+        群聊仅白名单群;操作者与消息作者不同(群管撤别人)时一并注明。
+        机器人自己消息被撤(或自己撤自己)也记录——这也是有效社交信号。
+        撤回行走 ctx_seq,定时渠道视作会话有变化,AI 可自然感知并回应。
+        """
+        ntype = event.get("notice_type")
+        if ntype not in ("group_recall", "friend_recall"):
+            return
+        msg_id = event.get("message_id")
+        if msg_id is None:
+            return
+        user_id = str(event.get("user_id", ""))       # 被撤消息的作者
+        if ntype == "group_recall":
+            group_id = str(event.get("group_id", ""))
+            if ALLOWED_GROUPS and group_id not in ALLOWED_GROUPS:
+                return
+            st = self.group_states.get(group_id)
+            if st is None:
+                return
+            operator = str(event.get("operator_id", "") or user_id)
+            entry = self._group_members.get(group_id)
+            members = entry["members"] if entry else []
+            qq_name = {str(m.get("user_id", "")): (m.get("card") or m.get("nickname") or "")
+                       for m in members}
+            actor = qq_name.get(operator) or operator
+            if operator == user_id:
+                line = (f"<撤回提醒: {actor}(qq_id@{operator}) "
+                        f"撤回了自己的消息 [msg_id#{msg_id}]>")
+            else:
+                owner = qq_name.get(user_id) or user_id
+                line = (f"<撤回提醒: {actor}(qq_id@{operator}) 撤回了 "
+                        f"{owner}(qq_id@{user_id}) 的消息 [msg_id#{msg_id}]>")
+            st.ctx.append(line)
+            st.since += 1
+            st.ctx_seq += 1
+        else:
+            # 私聊撤回: user_id 即对方(自己撤自己;机器人消息被撤不会上报此类型)
+            if user_id not in ADMIN_QQ and user_id not in ALLOWED_PRIVATE:
+                return
+            pst = self.private_states.get(user_id)
+            if pst is None:
+                return
+            pst.ctx.append(f"<撤回提醒: 对方撤回了消息 [msg_id#{msg_id}]>")
+            pst.since += 1
+        logger.info(f"撤回提醒已入上下文 {ntype} msg_id={msg_id}")
 
     async def _on_group_message(self, event: dict) -> None:
         group_id = str(event.get("group_id", ""))
@@ -1296,11 +1408,12 @@ class QQEngine:
             # ---- 渠道 1: @机器人(绝对触发,成功即短路) ----
             prompt = extract_prompt(event, self.self_id)
 
+            # 取件节奏先推进(任何真人发言都算"对话在进行",含斜杠命令)
+            self._touch_ready(st, now)
+
             # 斜杠命令: 管理员且 @机器人;识别成功即拦截
             if prompt is not None and await self.admin_commands.try_handle(event, prompt):
                 return
-
-            self._touch_ready(st, now)
 
             if prompt is not None:
                 # 被@即抬升临时热度(即使随后被个人冷却挡下);按次计,与@了几个人无关
@@ -1315,7 +1428,10 @@ class QQEngine:
                         "message_id": event.get("message_id"),
                     })
                     return
-                logger.debug(f"个人冷却中 group={group_id} user={user_id}")
+                # 冷却挡下的只是"绝对触发"待遇;消息本体落到下面照常进 ctx,
+                # AI 下回合仍能看到这条 @(此前会随 return 蒸发)
+                logger.info(f"@触发个人冷却中,降级为普通上下文 "
+                            f"group={group_id} user={user_id}")
 
             # ---- 普通消息: 进上下文队列 + 计热度 ----
             # 直接从缓存获取成员列表(可能为空),format_line 会降级处理
@@ -1352,11 +1468,11 @@ class QQEngine:
             rate = heat_rate(st, now) + st.tk * TK_MSG_MULT
             p = heat_prob(rate, MSG_PROB_LO, MSG_PROB_HI, MSG_PROB_CAP, MSG_PROB_THRESHOLD, MSG_PROB_CURVE)
             if p > 0 and random.random() < p:
-                logger.info(f"消息概率触发 group={group_id} rate={rate:.1f}(tk={st.tk:.1f}) p={p:.2f}")
+                logger.info(f"消息概率触发 group={group_id} rate={rate:.1f}(tk={st.tk:.1f}x{TK_MSG_MULT:g}={st.tk * TK_MSG_MULT:.1f}) p={p:.2f}")
                 self.enqueue_group(st, {"type": "proactive",
                                         "message_id": msg_id, "line": line})
             elif DEBUG_TRIGGER:
-                logger.info(f"[trigger] 消息判定未触发 group={group_id} rate={rate:.1f}(tk={st.tk:.1f}) p={p:.2f}")
+                logger.info(f"[trigger] 消息判定未触发 group={group_id} rate={rate:.1f}(tk={st.tk:.1f}x{TK_MSG_MULT:g}={st.tk * TK_MSG_MULT:.1f}) p={p:.2f}")
         except Exception:
             exc_text = traceback.format_exc()
             logger.exception(f"群消息处理异常 group={group_id}")
@@ -1385,9 +1501,10 @@ class QQEngine:
             now = time.monotonic()
             self._touch_ready(pst, now)
 
-            if now - pst.last_accepted < USER_COOLDOWN:
-                logger.debug(f"私聊个人冷却中,忽略消息 user={user_id}")
-                return
+            # 私聊不做冷却丢弃: 冷却丢的不是"触发机会"而是消息本身
+            # (曾致连发 1~9 只收到奇数)。频率自然由 T1/T2 取件节奏平滑,
+            # 排队消息经队列合并一个回合统一回应。last_accepted 仅作
+            # "对方开口过"的时间戳(好友问候取消判定用)。
             pst.last_accepted = now
 
             # 新好友问候: 对方先开口(文本或语音/图片等媒体消息,均会入队被回应)
@@ -1408,14 +1525,14 @@ class QQEngine:
             ]
             if self.self_id:
                 fake_members.append({"user_id": self.self_id, "card": "", "nickname": "Bot"})
-            
-            self._queue_push(pst, {
-                "type": "private",
-                "event": event,  # 保存完整 event 用于 format_line
-                "nickname": nickname,
-                "members": fake_members,  # 传给 format_line 用于 @名字转换
-                "message_id": event.get("message_id"),
-            })
+
+            # 消息本体进 ctx 缓冲(与群聊同构,连发不丢);pending 只放一个
+            # 去重的轻量触发标记——队列满挤掉标记也不损失任何消息内容
+            pst.ctx.append(format_line(event, fake_members))
+            pst.since += 1
+            pst.nickname = nickname
+            if not any(p.get("type") == "private" for p in pst.pending):
+                self._queue_push(pst, {"type": "private"})
         except Exception:
             exc_text = traceback.format_exc()
             logger.exception(f"私聊消息处理异常 user={user_id}")
@@ -1552,7 +1669,27 @@ class QQEngine:
             logger.warning(f"强刷群成员失败,已进入冷却 group={group_id}")
             return None
 
+    # 合并取件的主事件优先级: 上下文引导语跟着最"强"的事件走
+    _MERGE_PRIORITY = {"mention": 0, "wake": 1, "cron": 2, "keyword": 3, "proactive": 4}
+
     async def _process_group(self, group_id: str, st: GroupState, ev: dict) -> None:
+        # 队列合并事件: 拆出主事件(优先级最高者)走现有引导语路径,
+        # 其余事件的增量内容(@行/额外 cron 任务)在末尾统一追加,一个回合回应全部
+        extra_mentions: list[dict] = []
+        extra_crons: list[dict] = []
+        if ev.get("type") == "merged":
+            evs = ev["events"]
+            main = min(evs, key=lambda e: self._MERGE_PRIORITY.get(e.get("type"), 9))
+            for e in evs:
+                if e is main:
+                    continue
+                if e.get("type") == "mention":
+                    extra_mentions.append(e)
+                elif e.get("type") == "cron":
+                    extra_crons.append(e)
+                # 多余的 proactive/keyword/wake: 主事件回合已覆盖其语义,丢弃
+            ev = main
+
         # 快照并清空(每条消息只注入一次);递交失败回滚
         snapshot = list(st.ctx)
         snap_since = st.since
@@ -1589,6 +1726,16 @@ class QQEngine:
                        f"[{ev['nick']}(qq_id@{ev.get('user_id', '')})] @你: {ev['prompt']}")
             user_content = f"{block}\n\n{trigger}" if block else trigger
 
+        # 合并的增量内容: 其余 @ 逐条列出,额外 cron 任务逐个附带
+        if extra_mentions:
+            lines = [(f"[msg_id#{m['message_id']}]"
+                      f"[{m['nick']}(qq_id@{m.get('user_id', '')})] @你: {m['prompt']}")
+                     for m in extra_mentions]
+            user_content += ("\n\n<排队期间还有以下 @ 你的消息,请在本回合一并回应"
+                             "(可分别引用各自的消息 ID)>\n" + "\n".join(lines))
+        for c in extra_crons:
+            user_content += "\n\n" + load_cron_prompt(c["prompt"])
+
         # 场景头: 群号/群名注入(gateway 会话托管,system 模版由场景头替代)
         scene = group_scene_prompt(group_id, await self._group_name(group_id, st))
         full_text = f"{scene}\n\n{user_content}" if scene else user_content
@@ -1612,35 +1759,65 @@ class QQEngine:
                 except Exception:
                     logger.exception("错误提示发送失败")
 
+    @staticmethod
+    def _private_event_body(ev: dict) -> str:
+        """私聊自发事件 → 注入正文(不含场景头)。
+
+        普通消息不再经事件携带(消息本体在 pst.ctx 缓冲里,注入时整块取)。
+        """
+        if ev.get("type") == "cron":
+            return load_cron_prompt(ev["prompt"])
+        if ev.get("type") == "friend_greet":
+            return load_friend_prompt(ev.get("comment") or "")
+        # 兼容旧形状(升级瞬间队列里可能还有携带 event/text 的存量事件)
+        members = ev.get("members")
+        event = ev.get("event")
+        if event and members:
+            return format_line(event, members)
+        if event:
+            return f"[msg_id#{ev['message_id']}] {message_plain_text(event)}"
+        return str(ev.get("text") or "")
+
     async def _process_private(self, user_id: str, pst: PrivateState, ev: dict) -> None:
-        if ev.get("type") in ("cron", "friend_greet"):
-            # 自发唤醒(定时任务/新好友问候): 无入站消息,场景头 + 专用提示词
+        evs = ev["events"] if ev.get("type") == "merged" else [ev]
+        if any(e.get("type") in ("cron", "friend_greet") for e in evs):
+            # 自发唤醒(定时任务/新好友问候): 昵称经 API 现取
             nickname = user_id
             try:
                 info = await qq_api.get_stranger_info(int(user_id))
                 nickname = str((info or {}).get("nickname") or user_id)
             except Exception:
                 logger.debug(f"获取昵称失败,私聊唤醒用 QQ 号代替 user={user_id}")
-            scene = private_scene_prompt(user_id, nickname)
-            body = (load_cron_prompt(ev["prompt"]) if ev["type"] == "cron"
-                    else load_friend_prompt(ev.get("comment") or ""))
         else:
-            scene = private_scene_prompt(user_id, ev["nickname"])
-            # 私聊也用 format_line 把 @QQ 转成 @名字
-            members = ev.get("members")
-            event = ev.get("event")
-            if event and members:
-                body = format_line(event, members)
-            else:
-                # 兜底: 旧版本事件或 cron 任务,直接用纯文本
-                body = f"[msg_id#{ev['message_id']}] {message_plain_text(event)}" if event else ev.get("text", "")
+            nickname = pst.nickname or user_id
+        scene = private_scene_prompt(user_id, nickname)
+        # 消息块: ctx 缓冲快照并清空(与群聊同构;递交失败回滚,消息不丢)
+        snapshot = list(pst.ctx)
+        snap_since = pst.since
+        pst.ctx.clear()
+        pst.since = 0
+        parts: list[str] = []
+        block = build_ctx_block(snapshot, snap_since)
+        if block:
+            parts.append(block)
+        # 自发事件正文(cron/问候/旧形状存量)按顺序附加
+        parts.extend(b for b in (self._private_event_body(e) for e in evs) if b)
+        body = "\n".join(parts)
+        if not body.strip():
+            return   # 无消息无任务(如纯触发标记但 ctx 已被上个回合消费)
+        if len(snapshot) > 1 or len(evs) > 1:
+            logger.info(f"私聊合并注入 user={user_id} 消息={len(snapshot)}条 "
+                        f"事件={len(evs)}个")
         full_text = f"{scene}\n\n{body}" if scene else body
         chat_id = make_chat_id("private", user_id, pst.session_suffix)
         logger.info(f"唤醒注入 chat={chat_id} type={ev.get('type', 'private')}")
         try:
             await self._run_turn(chat_id, pst, full_text)
         except Exception as e:
-            logger.exception("私聊递交 gateway 失败")
+            # 递交失败(gateway 不可用等): 回滚缓冲,消息不丢(与群聊对齐)
+            pst.ctx = deque(snapshot + list(pst.ctx), maxlen=CTX_K)
+            pst.since += snap_since
+            logger.exception("私聊递交 gateway 失败(消息已回滚缓冲)")
             try:
                 await qq_api.send_private_msg(int(user_id),
                                               f"服务暂时不可用({type(e).__name__}),请稍后再试。")
@@ -1667,10 +1844,10 @@ class QQEngine:
                     rate = heat_rate(st, now) + st.tk * TK_TIMER_MULT
                     p = heat_prob(rate, TIMER_PROB_LO, TIMER_PROB_HI, TIMER_PROB_CAP, TIMER_PROB_THRESHOLD, TIMER_PROB_CURVE)
                     if p > 0 and random.random() < p:
-                        logger.info(f"定时概率触发 group={group_id} rate={rate:.1f}(tk={st.tk:.1f}) p={p:.2f}")
+                        logger.info(f"定时概率触发 group={group_id} rate={rate:.1f}(tk={st.tk:.1f}x{TK_TIMER_MULT:g}={st.tk * TK_TIMER_MULT:.1f}) p={p:.2f}")
                         self.enqueue_group(st, {"type": "proactive"})
                     elif DEBUG_TRIGGER:
-                        logger.info(f"[trigger] 定时判定未触发 group={group_id} rate={rate:.1f}(tk={st.tk:.1f}) p={p:.2f}")
+                        logger.info(f"[trigger] 定时判定未触发 group={group_id} rate={rate:.1f}(tk={st.tk:.1f}x{TK_TIMER_MULT:g}={st.tk * TK_TIMER_MULT:.1f}) p={p:.2f}")
                 except Exception:
                     exc_text = traceback.format_exc()
                     logger.exception(f"定时器判定异常 group={group_id}")

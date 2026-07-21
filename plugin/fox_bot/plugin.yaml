@@ -129,7 +129,10 @@ optional_env:
     description: "上下文队列长度 K(默认 50)"
     password: false
   - name: FOX_QQ_BOT_TRIGGER_QUEUE
-    description: "待处理触发队列长度(默认 3)"
+    description: "待处理触发队列长度(默认 5)"
+    password: false
+  - name: FOX_QQ_BOT_QUEUE_MERGE
+    description: "队列合并取件(默认 false): 空闲取件时一次取完队列所有剩余事件合成一个回合(多个 @ 一并回应、上下文只注入一次、cron 任务逐个保留);关闭=逐个取件每事件一个回合"
     password: false
   - name: FOX_QQ_BOT_PROCESS_DELAY
     description: "对话处理延迟 T1 秒(默认 6)"
@@ -138,7 +141,7 @@ optional_env:
     description: "连续对话推迟延迟 T2 秒(默认 2)"
     password: false
   - name: FOX_QQ_BOT_USER_COOLDOWN
-    description: "个人冷却秒(默认 1)"
+    description: "个人冷却秒(默认 1;仅群聊@触发限频,私聊消息永不丢弃)"
     password: false
   - name: FOX_QQ_BOT_GROUP_SHARED_COOLDOWN
     description: "群共享冷却秒,压制概率触发(默认 0=关闭)"
@@ -198,7 +201,7 @@ optional_env:
     description: "TK 对每条消息渠道概率的乘数(默认 0.1,0=无影响)"
     password: false
   - name: FOX_QQ_BOT_GROUP_TK_TIMER_MULT
-    description: "TK 对定时渠道概率的乘数(默认 1.0,0=无影响)"
+    description: "TK 对定时渠道概率的乘数(默认 0.7,0=无影响)"
     password: false
   - name: FOX_QQ_BOT_GROUP_CUT_LINE
     description: "比例衰减共享归零阈值(TK 与累计热度 C 共用,默认 0.1)"
@@ -343,7 +346,7 @@ optional_env:
     description: "上下文队列调试日志(入队/注入长度)"
     password: false
   - name: FOX_QQ_BOT_DEBUG_TOOL
-    description: "工具调用解析调试日志(工具名/chat_id/参数键)"
+    description: "工具调用参数值摘要调试日志(工具名/耗时/成败的入口收尾日志已常驻 INFO,无需开关)"
     password: false
   - name: FOX_QQ_BOT_DEBUG_WS
     description: "WebSocket 原始帧调试日志(收发完整 JSON,量大)"

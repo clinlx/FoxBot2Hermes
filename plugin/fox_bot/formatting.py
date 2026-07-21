@@ -33,8 +33,11 @@ AT_DIGITS_RE = re.compile(r"\d+")
 AT_UNKNOWN_MAX_DIGITS = 20  # "@+小于20个字符且纯数字"才进入未知 QQ 号检测
 
 # AI 主动引用标记: 回复开头(忽略前导空白)的 [#reply@消息ID]。
-# 只识别开头第一个(QQ 限制单条引用),正文其余位置原样保留
+# 只有开头的标记生效(QQ 限制单条引用)
 REPLY_MARK_RE = re.compile(r"^\s*\[#reply@(-?\d+)\]\s?", re.I)
+# 正文中间误写的引用标记: 不生效,但也不能字面漏给用户——剥除
+# (只吞行内空白,不吞换行,保持多行排版)
+REPLY_MARK_ANY_RE = re.compile(r"[ \t]?\[#reply@(-?\d+)\][ \t]?", re.I)
 
 
 # ---------------------------------------------------------------------------
@@ -128,12 +131,22 @@ def split_end_marker(text: str) -> tuple[str, bool]:
     return text, False
 
 
-def extract_reply_target(text: str) -> tuple[int | None, str]:
-    """解析开头的 [#reply@消息ID];命中返回 (ID, 去标记正文),未命中 (None, 原文)。"""
+def extract_reply_target(text: str) -> tuple[int | None, str, int]:
+    """解析开头的 [#reply@消息ID];返回 (引用ID|None, 去标记正文, 中间误写剥除数)。
+
+    正文中间误写的引用标记(AI 偶尔在一段话里写第二个)不产生引用,
+    但一律剥除——否则 "[#reply@123]" 会字面显示给用户。剥除数量返回给
+    调用方,发送工具据此在返回值里附提醒,AI 可自纠。
+    """
     m = REPLY_MARK_RE.match(text or "")
     if m is None:
-        return None, text
-    return int(m.group(1)), text[m.end():]
+        reply_to, body = None, text or ""
+    else:
+        reply_to, body = int(m.group(1)), (text or "")[m.end():]
+    body, n = REPLY_MARK_ANY_RE.subn(" ", body)
+    if n:
+        body = re.sub(r"[ \t]{2,}", " ", body)   # 剥除处收拢多余空格,保留换行
+    return reply_to, body, n
 
 
 # ---------------------------------------------------------------------------
@@ -203,18 +216,18 @@ def split_reply(text: str) -> list[str]:
     return segments
 
 
-def prepare_outgoing(content: str) -> tuple[int | None, list[str], str | None]:
+def prepare_outgoing(content: str) -> tuple[int | None, list[str], str | None, int]:
     """出站文本的完整后处理管线(工具 handler 使用)。
 
-    返回 (reply_to, 分段列表, 附发图片URL)。正文降级后为空时
-    分段列表为空(调用方决定是否报错)。
+    返回 (reply_to, 分段列表, 附发图片URL, 中间误写引用标记剥除数)。
+    正文降级后为空时分段列表为空(调用方决定是否报错)。
     """
-    reply_to, body = extract_reply_target(content)
+    reply_to, body, stripped = extract_reply_target(content)
     text = plain_qq_text(body)
     if not text:
-        return reply_to, [], None
+        return reply_to, [], None, stripped
     image_url = first_image_url(text) if IMAGE_URL_AS_IMAGE else None
-    return reply_to, split_reply(text), image_url
+    return reply_to, split_reply(text), image_url, stripped
 
 
 # ---------------------------------------------------------------------------

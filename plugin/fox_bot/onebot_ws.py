@@ -20,8 +20,12 @@ import hmac
 import itertools
 import json
 import logging
+import time
+from collections import deque
 from collections.abc import Awaitable, Callable
 from typing import Any
+
+from . import clockcheck
 
 logger = logging.getLogger("fox_bot.ws")
 
@@ -53,6 +57,39 @@ _SEND_ACTION_PREFIXES = (
 
 def _is_send_action(action: str) -> bool:
     return action.startswith(_SEND_ACTION_PREFIXES)
+
+
+def _resolve_future(fut: asyncio.Future, result: dict | None = None,
+                    exc: BaseException | None = None) -> None:
+    """跨事件循环安全地完成 Future。
+
+    Hermes gateway 在 async 上下文里执行工具时,handler 跑在**独立线程的
+    独立事件循环**(model_tools._run_async);call() 创建的 Future 属于
+    工具线程的 loop,而 WS 读循环在主 loop 线程。直接 set_result 不会
+    唤醒别的 loop —— 等待方要睡满 wait_for 的超时定时器醒来才发现结果
+    早就放好了(实测症状: 每次发送精确耗时 30.0s 且"成功")。
+    必须经 call_soon_threadsafe 投递到 Future 所属 loop 完成。
+    """
+    def _do() -> None:
+        if fut.done():
+            return
+        if exc is not None:
+            fut.set_exception(exc)
+        else:
+            fut.set_result(result)
+
+    loop = fut.get_loop()
+    try:
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        running = None
+    if loop is running:
+        _do()
+    else:
+        try:
+            loop.call_soon_threadsafe(_do)
+        except RuntimeError:
+            pass   # 目标 loop 已关闭(等待方已放弃),无需完成
 
 
 def _is_napcat_send_timeout(resp: dict) -> bool:
@@ -91,6 +128,12 @@ class OneBotWSServer:
         self._pending: dict[str, asyncio.Future] = {}   # echo -> Future
         self._event_queue: asyncio.Queue = asyncio.Queue(maxsize=_EVENT_QUEUE_MAX)
         self._event_task: asyncio.Task | None = None    # 事件消费任务(懒启动)
+        # 在途消息发送: echo -> (chat_kind, target_id)。message_sent 回环
+        # 命中同目标时提前确认该调用(NapCat 等送达确认可能白等 ~30s,
+        # 而回环事件通常亚秒到达——它就是"已发出"的最好证据)
+        self._inflight_sends: dict[str, tuple[str, str]] = {}
+        # 近期经回环提前确认的 echo(迟到的正式响应按预期丢弃,不告警)
+        self._early_confirmed: "deque[str]" = deque(maxlen=64)
 
     # ---- 生命周期 ----
 
@@ -188,19 +231,31 @@ class OneBotWSServer:
         if echo is not None and "post_type" not in frame:
             fut = self._pending.pop(str(echo), None)
             if fut is not None and not fut.done():
-                fut.set_result(frame)
+                _resolve_future(fut, frame)
             elif fut is None:
-                # 等待者已放弃(超时/断连)后响应才到。没有这行日志,
-                # "调用报超时但动作其实执行成功"这类故障在日志里完全隐形
-                logger.warning(
-                    f"孤儿 API 响应(调用方已超时/断连放弃): echo={echo} "
-                    f"status={frame.get('status')} retcode={frame.get('retcode')}"
-                )
+                if str(echo) in self._early_confirmed:
+                    # 已被 message_sent 回环提前确认的发送,正式响应姗姗来迟
+                    # (常带 retcode=1200 确认超时)——预期情况,无需告警
+                    logger.debug(f"迟到的发送响应(已提前确认): echo={echo} "
+                                 f"retcode={frame.get('retcode')}")
+                else:
+                    # 等待者已放弃(超时/断连)后响应才到。没有这行日志,
+                    # "调用报超时但动作其实执行成功"这类故障在日志里完全隐形
+                    logger.warning(
+                        f"孤儿 API 响应(调用方已超时/断连放弃): echo={echo} "
+                        f"status={frame.get('status')} retcode={frame.get('retcode')}"
+                    )
             return
         # 事件帧
         post_type = frame.get("post_type")
         if post_type == "meta_event":
             return  # 心跳/lifecycle,吞掉
+        if post_type == "message_sent":
+            # 排查日志: 回环完整关键字段 + 当时在途表(定位提前确认为何未触发)
+            logger.info(f"[early-confirm] 回环到达 target_id={frame.get('target_id')} "
+                        f"user_id={frame.get('user_id')} group_id={frame.get('group_id')} "
+                        f"在途={dict(self._inflight_sends)} server_id={id(self)}")
+            self._confirm_inflight_send(frame)   # 回环即送达证据,提前确认在途发送
         # 排查日志: 每个非心跳入站帧一行骨架(INFO 级,不含正文)——
         # 用于确认 NapCat 到底推没推、推的是什么形状。稳定后可降回 DEBUG。
         logger.info(
@@ -238,6 +293,69 @@ class OneBotWSServer:
             finally:
                 self._event_queue.task_done()
 
+    def _confirm_inflight_send(self, frame: dict) -> None:
+        """message_sent 回环 → 提前确认同目标的在途 send_*_msg 调用。
+
+        NapCat 的 sendMsg 响应要等 NTQQ 送达确认事件,部分环境该事件
+        永远不来(每次白等 ~30s 内部超时);而 message_sent 回环通常
+        亚秒到达,且带真实 message_id——直接以它构造响应唤醒等待者。
+        NapCat 的正式响应随后到达时按孤儿响应丢弃(仅 DEBUG 日志)。
+        单聊天串行发送(worker 模型),同目标同时至多一个在途,按目标
+        匹配取最早的一个(FIFO)即正确对应。
+        """
+        # 配对键: 群聊用 group_id;私聊用 target_id(=接收方)。
+        # 注意私聊回环的 user_id 是机器人自己(发送者),绝不能拿来配对;
+        # 部分 NapCat 版本私聊回环不带 target_id(Optional),此时走唯一性
+        # 兜底: 在途私聊发送只有一个时可安全确认(worker 串行,常态如此)
+        if frame.get("group_id") is not None:
+            key = ("group", str(frame["group_id"]))
+        elif frame.get("target_id") is not None:
+            key = ("private", str(frame["target_id"]))
+        else:
+            key = None
+        echo = None
+        if key is not None:
+            echo = next((e for e, k in self._inflight_sends.items() if k == key), None)
+        if echo is None and key is None:
+            privs = [e for e, k in self._inflight_sends.items() if k[0] == "private"]
+            if len(privs) == 1:
+                echo = privs[0]
+        if echo is None:
+            # 在途为空也要发声——上一轮排查因这里静默,失效在日志里隐形
+            logger.info(f"message_sent 回环未匹配到在途发送(不提前确认): "
+                        f"key={key} target_id={frame.get('target_id')} "
+                        f"在途={list(self._inflight_sends.values())}")
+            return
+        self._inflight_sends.pop(echo, None)
+        fut = self._pending.pop(echo, None)
+        if fut is None or fut.done():
+            logger.info(f"回环命中在途但等待者已消失(echo={echo} "
+                        f"fut={'done' if fut else 'None'}),不提前确认")
+            return
+        self._early_confirmed.append(echo)
+        _resolve_future(fut, {
+            "status": "ok", "retcode": 0,
+            "data": {"message_id": frame.get("message_id")},
+            "_early_confirmed": True,
+        })
+        logger.info(f"发送经 message_sent 回环提前确认 echo={echo} "
+                    f"message_id={frame.get('message_id')}")
+
+    @staticmethod
+    def _send_target_key(action: str, params: dict) -> tuple[str, str] | None:
+        """send_*_msg 动作 → 在途登记键(chat_kind, target_id);其余 None。
+
+        只覆盖文本/图片消息发送(send_group_msg/send_private_msg/send_msg):
+        它们才有 message_sent 回环;文件上传(upload_*)走的是另一条通知,不登记。
+        """
+        if not action.startswith(("send_group_msg", "send_private_msg", "send_msg")):
+            return None
+        if params.get("group_id") is not None:
+            return ("group", str(params["group_id"]))
+        if params.get("user_id") is not None:
+            return ("private", str(params["user_id"]))
+        return None
+
     def _fail_pending(self, reason: str) -> None:
         """连接失效时让在途 API 调用立即失败——响应不可能再到达,不必等满超时。"""
         if not self._pending:
@@ -245,7 +363,7 @@ class OneBotWSServer:
         logger.warning(f"{reason}: {len(self._pending)} 个在途 API 调用立即失败")
         for fut in self._pending.values():
             if not fut.done():
-                fut.set_exception(ConnectionError(reason))
+                _resolve_future(fut, exc=ConnectionError(reason))
         self._pending.clear()
 
     # ---- API 调用(qq_api.set_caller 的注入目标) ----
@@ -263,6 +381,14 @@ class OneBotWSServer:
         echo = f"qq-{next(self._echo_seq)}"
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending[echo] = fut
+        # 消息发送登记在途: message_sent 回环到达即提前确认,不等 NapCat
+        # 慢响应(部分环境送达确认失灵,每次白等 ~30s)
+        skey = self._send_target_key(action, params)
+        if skey is not None:
+            self._inflight_sends[echo] = skey
+            logger.info(f"[early-confirm] 在途登记 echo={echo} key={skey} "
+                        f"server_id={id(self)}")
+        t0 = time.monotonic()
         try:
             frame = {"action": action, "params": params, "echo": echo}
             if _DEBUG_WS:
@@ -275,6 +401,11 @@ class OneBotWSServer:
         except Exception:
             self._pending.pop(echo, None)
             raise
+        finally:
+            self._inflight_sends.pop(echo, None)
+        # 发送类调用异常缓慢(疑似时钟漂移致送达确认失灵)→ 带节流的诊断告警
+        if _is_send_action(action):
+            clockcheck.note_slow_send(action, time.monotonic() - t0)
         if resp.get("status") == "failed":
             # NapCat 的 sendMsg 确认超时: 消息多半已送达,不当硬失败,
             # 否则上层(AI)会误判失败重发,造成重复消息

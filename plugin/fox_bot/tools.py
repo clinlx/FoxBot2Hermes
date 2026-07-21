@@ -135,9 +135,10 @@ async def tool_send_message(args: dict, context: dict | None = None) -> dict:
     if not content.strip():
         return {"error": "content 为空"}
 
-    reply_to, segments, image_url = prepare_outgoing(content)
+    reply_to, segments, image_url, reply_stripped = prepare_outgoing(content)
     logger.info(f"[send] → {ctype}:{target} segs={len(segments)} "
-                f"reply_to={reply_to} image={bool(image_url)}")
+                f"reply_to={reply_to} image={bool(image_url)}"
+                + (f" 剥除中间引用标记={reply_stripped}" if reply_stripped else ""))
     if not segments and not image_url:
         return {"error": "内容经格式处理后为空,未发送"}
 
@@ -242,6 +243,11 @@ async def tool_send_message(args: dict, context: dict | None = None) -> dict:
                     "segments": len(segments) + (1 if image_url else 0)}
     if bad_ats:
         result["warning"] = _bad_at_warning(bad_ats)
+    if reply_stripped:
+        result["reply_mark_warning"] = (
+            f"提醒: 正文中出现了 {reply_stripped} 个额外的 [#reply@消息ID] 标记,"
+            "已自动删除(未显示给用户)。引用标记只能出现一次且必须放在 content"
+            " 最开头;想引用多条消息请分多次调用本工具,每次引用一条。")
     
     # 发送表情(在正文全部发送完成后,独立一条消息)
     if emoticon:

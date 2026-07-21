@@ -15,6 +15,7 @@ tools(工具层)在此接线;机制逻辑全部在 engine.py。
 import asyncio
 import logging
 import os
+import time
 
 if __package__ in (None, ""):
     # 插件加载器按文件路径直接加载本文件时(spec_from_file_location),
@@ -96,11 +97,14 @@ PLATFORM_HINT = (
     "\n"
     "## 引用与提醒规则\n"
     "1. 引用标记 [#reply@消息ID]:\n"
-    "   - 放在 fox_qq_send_message content 的最开头\n"
+    "   - 放在 fox_qq_send_message content 的最开头,且一条 content 里只能出现一次"
+    "(正文中间的引用标记不生效,会被系统删除并提醒你)\n"
     "   - 用于引用指定消息(转为 QQ 引用效果,不显示在正文)\n"
-    "   - 一次发言只能引用一条消息;需回复多条则多次调用工具发言\n"
+    "   - 需引用多条消息则多次调用工具发言,每次引用一条\n"
     "   - 消息 ID 取自注入历史的 [msg_id#数字] 前缀\n"
     "   - 连续对同一人回答时,仅首次消息引用,后续消息不引用\n"
+    "   - 同一用户连发的多条关联较大的消息,可只引用其中一条一并回答,"
+    "不必逐条分别回复\n"
     "   - 单独参与闲聊无需引用具体消息时可不使用引用标记\n"
     "2. @提醒标记:\n"
     "   - 格式: @QQ号(数字),需用空格与后续内容隔开\n"
@@ -350,23 +354,34 @@ def _wrap_handler(fn):
         chat_id = _current_chat_id(session_id)
         if chat_id:
             context["chat_id"] = chat_id
-        if TOOL_DEBUG:
-            logger.info("[tool] %s chat_id=%r args_keys=%s",
-                        getattr(fn, "__name__", "?"), chat_id, list((args or {}).keys()))
         tool_name = tools.tool_public_name(fn)
+        # 调用入口常驻一行(工具名/会话/参数键,不含参数值);
+        # DEBUG_TOOL 开时额外附参数值摘要
+        if TOOL_DEBUG:
+            args_repr = _json.dumps(args or {}, ensure_ascii=False)[:300]
+            logger.info(f"[tool] {tool_name} chat={chat_id!r} args={args_repr}")
+        else:
+            logger.info(f"[tool] {tool_name} chat={chat_id!r} "
+                        f"args_keys={list((args or {}).keys())}")
         engine = tools.get_engine()
+        t0 = time.monotonic()
         try:
             result = await fn(args or {}, context or None)
         except Exception as e:
             # 工具抛异常也登记进回合轨迹(超时排查用),异常继续上抛给 registry
+            logger.warning(f"[tool] {tool_name} 异常({time.monotonic() - t0:.1f}s): "
+                           f"{type(e).__name__}: {e}")
             if engine is not None:
                 engine.note_tool_call(chat_id, tool_name, False,
                                       f"{type(e).__name__}: {e}")
             raise
         # 登记回合轨迹: 工具名 + 成败(dict 契约: error 键即失败),不含详细输出
+        ok = not (isinstance(result, dict) and result.get("error"))
+        brief = str(result.get("error", "")) if isinstance(result, dict) else ""
+        logger.info(f"[tool] {tool_name} {'完成' if ok else '失败'}"
+                    f"({time.monotonic() - t0:.1f}s)"
+                    + (f": {brief[:120]}" if brief else ""))
         if engine is not None:
-            ok = not (isinstance(result, dict) and result.get("error"))
-            brief = str(result.get("error", "")) if isinstance(result, dict) else ""
             engine.note_tool_call(chat_id, tool_name, ok, brief)
         return result if isinstance(result, str) else _json.dumps(result, ensure_ascii=False)
     return h
