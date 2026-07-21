@@ -62,8 +62,8 @@ optional_env:
   - name: FOX_QQ_BOT_IMAGE_OPENAI_MODEL
     description: "openai 方案模型(默认 gpt-image-2)"
     password: false
-  - name: FOX_QQ_BOT_IMAGE_OPENAI_SIZE
-    description: "openai 方案默认分辨率(内置默认 auto;AI 可按次覆盖)"
+  - name: FOX_QQ_BOT_IMAGE_OPENAI_DEFAULT_SIZE
+    description: "openai 方案缺省分辨率(内置 auto;AI 工具参数可按次覆盖,非强制值;旧名 FOX_QQ_BOT_IMAGE_OPENAI_SIZE 仍兼容)"
     password: false
   - name: FOX_QQ_BOT_IMAGE_OPENAI_REF
     description: "openai 方案参考图(图生图)开关,默认 false(开启走 /images/edits;通用兼容服务不支持时保持关闭)"
@@ -77,8 +77,8 @@ optional_env:
   - name: FOX_QQ_BOT_IMAGE_DOUBAO_MODEL
     description: "doubao 方案方舟模型号(必填,如 doubao-seedream-4-0-250828;填了 KEY 缺它=配置错误,该方案不生效)"
     password: false
-  - name: FOX_QQ_BOT_IMAGE_DOUBAO_SIZE
-    description: "doubao 方案默认分辨率(内置默认 1K;AI 可按次覆盖)"
+  - name: FOX_QQ_BOT_IMAGE_DOUBAO_DEFAULT_SIZE
+    description: "doubao 方案缺省分辨率(内置 1K;AI 工具参数可按次覆盖,非强制值;旧名 FOX_QQ_BOT_IMAGE_DOUBAO_SIZE 仍兼容)"
     password: false
   - name: FOX_QQ_BOT_IMAGE_DOUBAO_REF
     description: "doubao 方案参考图开关,默认 false(开启经 image 参数传参考图)"
@@ -88,6 +88,18 @@ optional_env:
     password: false
   - name: FOX_QQ_BOT_IMAGE_TIMEOUT
     description: "生图请求超时秒(默认 120)"
+    password: false
+  - name: FOX_QQ_BOT_TOOL_OCR
+    description: "OCR 工具开关(默认 false): 本地识别图片文字,注册 fox_qq_ocr_image;开了但后端不可用则不注册并告警"
+    password: false
+  - name: FOX_QQ_BOT_OCR_BACKEND
+    description: "OCR 后端(默认 tesseract): tesseract=CLI 子进程零常驻内存,沙盒模式经 docker exec 在容器内跑;rapidocr=ONNX 推理精度更高但常驻 300-500MB 内存,需 pip install rapidocr-onnxruntime;napcat=QQ 自带 OCR 零本地开销,但 NapCat 中此功能仅支持 Windows 端(Linux/Docker 部署会超时)"
+    password: false
+  - name: FOX_QQ_BOT_OCR_TESSERACT_LANG
+    description: "tesseract 语言包 -l 参数(默认 chi_sim+eng)"
+    password: false
+  - name: FOX_QQ_BOT_TOOL_STT
+    description: "语音转文字工具开关(默认 true): QQ 自带 STT,注册 fox_qq_voice_to_text"
     password: false
   - name: FOX_QQ_BOT_GROUP_ALLOW_ALL_GROUP_USERS
     description: "是否放行群内所有成员触发(默认 true)。设 false 后仅名单内成员+管理员的消息参与触发"

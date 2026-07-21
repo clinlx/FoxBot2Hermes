@@ -29,8 +29,11 @@ from .config import (
     IMAGE_DEFAULT,
     IMAGE_PROVIDERS,
     MEDIA_MAX_MB,
+    OCR_BACKEND,
     RESOLVE_AT,
     TMP_DIR,
+    TOOL_OCR,
+    TOOL_STT,
 )
 from .formatting import (
     ensure_reply_at,
@@ -735,31 +738,15 @@ async def tool_get_forward_msg(args: dict, context: dict | None = None) -> dict:
     return result
 
 
-def _ocr_lines(data: Any) -> list[str]:
-    """ocr_image 返回 → 文本行列表;confidence 兼容 0~1 / 0~100 两种刻度,<60 过滤。"""
-    lines: list[str] = []
-    for item in (data or {}).get("texts") or []:
-        if not isinstance(item, dict):
-            continue
-        text = str(item.get("text") or "").strip()
-        if not text:
-            continue
-        conf = item.get("confidence")
-        try:
-            if conf is not None:
-                c = float(conf)
-                if c <= 1.0:
-                    c *= 100
-                if c < 60:
-                    continue
-        except (TypeError, ValueError):
-            pass
-        lines.append(text)
-    return lines
-
-
 async def tool_ocr_image(args: dict, context: dict | None = None) -> dict:
-    """图片 OCR: 传消息 ID(取该消息里的图片)或直接传图片 URL。"""
+    """图片 OCR: 传消息 ID(取该消息里的图片)或图片 URL/路径。
+
+    识别走 ocr.recognize,按 FOX_QQ_BOT_OCR_BACKEND 分派后端
+    (tesseract/rapidocr/napcat;napcat 即 QQ 自带 OCR,仅 Windows 端
+    NapCat 支持)。图片字节经 _load_ref_bytes 取得(URL 下载 /
+    本地路径走沙盒边界)。
+    """
+    from . import ocr
     image = str(args.get("image") or "").strip()
     message_id = args.get("message_id")
     files: list[str] = []
@@ -781,17 +768,22 @@ async def tool_ocr_image(args: dict, context: dict | None = None) -> dict:
         if not files:
             return {"error": f"消息 {message_id} 里没有图片"}
     else:
-        return {"error": "需提供 message_id(取消息里的图片)或 image(图片 URL)"}
+        return {"error": "需提供 message_id(取消息里的图片)或 image(图片 URL/路径)"}
 
     results: list[dict] = []
     for f in files:
+        loaded = await _load_ref_bytes(f)
+        if isinstance(loaded, dict):
+            results.append(loaded)
+            continue
+        data, _mime = loaded
         try:
-            data = await qq_api.ocr_image(f)
+            lines = await ocr.recognize(data)
         except Exception as e:
             logger.exception("fox_qq_ocr_image OCR 失败")
             results.append({"error": f"OCR 失败: {type(e).__name__}: {e}"})
             continue
-        results.append({"text": "\n".join(_ocr_lines(data))})
+        results.append({"text": "\n".join(lines) or "(未识别到文字)"})
     if len(results) == 1:
         one = results[0]
         if "error" in one:
@@ -972,50 +964,16 @@ TOOL_SPECS: list[dict] = [
         },
         "handler": tool_get_forward_msg,
     },
-    {
-        "name": "fox_qq_voice_to_text",
-        "description": (
-            "语音转文字(QQ 自带识别)。传含语音消息的 message_id(msg_id#后的数字),"
-            "返回识别出的文本。"
-        ),
-        "schema": {
-            "type": "object",
-            "properties": {
-                "message_id": {"type": "string",
-                               "description": "含语音的消息 ID(取自 msg_id#)"},
-            },
-            "required": ["message_id"],
-        },
-        "handler": tool_voice_to_text,
-    },
 ]
 
+# 可选工具(按开关注册,见文件末尾):
+# - fox_qq_ocr_image: 本地 OCR(RapidOCR),FOX_QQ_BOT_TOOL_OCR 默认关;
+# - fox_qq_voice_to_text: QQ 自带 STT,FOX_QQ_BOT_TOOL_STT 默认开。
 # 下列工具默认禁用(已实现但未注册进 TOOL_SPECS),需要时手动启用:
-# - fox_qq_ocr_image: QQ 自带 OCR——NapCat 的实现走 NTQQ wantWinScreenOCR,
-#   官方注明"仅Windows端支持",Linux 部署下永不响应(90s 超时),故下线;
-#   图片识别建议由 AI 在终端沙盒用 tesseract 等本地 OCR 完成
 # - fox_qq_emoji_react: 消息表情回应
 # - fox_qq_poke: 戳一戳
 # - fox_qq_delete_msg: 撤回消息
 DISABLED_TOOL_SPECS: list[dict] = [
-    {
-        "name": "fox_qq_ocr_image",
-        "description": (
-            "识别图片中的文字(QQ 自带 OCR,NapCat 仅 Windows 端支持,Linux 下超时)。"
-            "二选一: 传 message_id(msg_id#后的数字,识别该消息里的图片,多图逐张识别)"
-            "或传 image(图片 URL)。返回识别出的文本。"
-        ),
-        "schema": {
-            "type": "object",
-            "properties": {
-                "message_id": {"type": "string",
-                               "description": "含图片的消息 ID(取自 msg_id#)"},
-                "image": {"type": "string", "description": "图片 URL(与 message_id 二选一)"},
-            },
-            "required": [],
-        },
-        "handler": tool_ocr_image,
-    },
     {
         "name": "fox_qq_emoji_react",
         "description": (
@@ -1254,3 +1212,53 @@ def _gen_image_spec() -> dict:
 
 if IMAGE_PROVIDERS:
     TOOL_SPECS.append(_gen_image_spec())
+
+
+# ---------------------------------------------------------------------------
+# 可选工具: OCR(默认关)/ STT(默认开),各自开关控制注册
+# ---------------------------------------------------------------------------
+
+if TOOL_OCR:
+    from . import ocr as _ocr_mod
+    _ok, _why = _ocr_mod.available()
+    if not _ok:
+        logger.warning(f"[ocr] FOX_QQ_BOT_TOOL_OCR 已开但后端不可用,不注册: {_why}")
+    else:
+        TOOL_SPECS.append({
+            "name": "fox_qq_ocr_image",
+            "description": (
+                f"识别图片中的文字(本地 OCR,后端 {OCR_BACKEND})。"
+                "二选一: 传 message_id(msg_id#后的数字,识别该消息里的图片,"
+                "多图逐张识别)或传 image(图片 URL/媒体链接/你文件系统里的路径)。"
+                "返回识别出的文本行。"
+            ),
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "message_id": {"type": "string",
+                                   "description": "含图片的消息 ID(取自 msg_id#)"},
+                    "image": {"type": "string",
+                              "description": "图片 URL/路径(与 message_id 二选一)"},
+                },
+                "required": [],
+            },
+            "handler": tool_ocr_image,
+        })
+
+if TOOL_STT:
+    TOOL_SPECS.append({
+        "name": "fox_qq_voice_to_text",
+        "description": (
+            "语音转文字(QQ 自带识别)。传含语音消息的 message_id(msg_id#后的数字),"
+            "返回识别出的文本。"
+        ),
+        "schema": {
+            "type": "object",
+            "properties": {
+                "message_id": {"type": "string",
+                               "description": "含语音的消息 ID(取自 msg_id#)"},
+            },
+            "required": ["message_id"],
+        },
+        "handler": tool_voice_to_text,
+    })

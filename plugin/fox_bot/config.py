@@ -538,6 +538,24 @@ if not os.path.isdir(EMOTICONS_DIR):
         EMOTICONS_DIR = _fallback
 
 
+# ---- 可选工具开关 ----
+# OCR: 本地识别,替代 NapCat 的 QQ 自带 OCR(仅 Windows 可用)。
+# 默认关;开了但所选后端不可用则不注册并告警。
+TOOL_OCR = _env_bool("FOX_QQ_BOT_TOOL_OCR")
+# OCR 后端:
+#   tesseract(默认) CLI 子进程,零常驻内存;沙盒模式经 docker exec 在
+#                    容器内跑(酒狐沙盒已装 tesseract-ocr + chi_sim/eng);
+#   rapidocr         ONNX 推理,精度更高但常驻 300-500MB 内存、单图打满
+#                    单核 1~3s,需 pip install rapidocr-onnxruntime;
+#   napcat           QQ 自带 OCR(NapCat ocr_image 接口),零本地开销,
+#                    但 NapCat 中此功能仅支持 Windows 端——Linux/Docker
+#                    部署的 NapCat 调用永不响应(超时),勿在其上选用
+OCR_BACKEND = _env_str("FOX_QQ_BOT_OCR_BACKEND", "tesseract").strip().lower()
+# tesseract 语言包(-l 参数)
+OCR_TESSERACT_LANG = _env_str("FOX_QQ_BOT_OCR_TESSERACT_LANG", "chi_sim+eng")
+# STT: 语音转文字走 QQ 自带接口(NapCat fetch_ptt_text),无额外依赖,默认开。
+TOOL_STT = _env_bool("FOX_QQ_BOT_TOOL_STT", "true")
+
 # ---- 通用生图(默认全空 = 功能关闭,工具不注册) ----
 # 两套内置方案共用 OpenAI 风格 /images/generations 协议:
 #   openai: GPT-image 系列(默认 gpt-image-2;参考图走 /images/edits)
@@ -567,7 +585,10 @@ def _build_image_providers(getenv) -> tuple[dict, str, list]:
                           "(方舟模型号必填),该方案不生效")
             continue
         base = ((getenv(f"{pre}_BASE_URL") or "").strip() or d["base_url"]).rstrip("/")
-        size = (getenv(f"{pre}_SIZE") or "").strip() or d["size"]
+        # DEFAULT_SIZE 是缺省分辨率(AI 工具参数 size 可按次覆盖),非强制值;
+        # 旧名 _SIZE 语义有误导,保留兼容(新名优先)
+        size = ((getenv(f"{pre}_DEFAULT_SIZE") or "").strip()
+                or (getenv(f"{pre}_SIZE") or "").strip() or d["size"])
         ref = str(getenv(f"{pre}_REF") or "").strip().lower() in {"1", "true", "yes", "on"}
         providers[name] = {"name": name, "api_key": key, "base_url": base,
                            "model": model, "size": size, "ref": ref}
