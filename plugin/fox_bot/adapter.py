@@ -114,6 +114,11 @@ PLATFORM_HINT = (
     "   - 自主发言或开启新话题时可选择不@任何人\n"
     "   - 示例(带引用): [#reply@6789] @12345 @54321 说得对!\n"
     "   - 示例(无引用): @12345 @54321 我来了!\n"
+    "3. 表情图片(fox_qq_send_message 的 emoticon 字段,可选):\n"
+    "   - 从可用名单里选一个名字,随消息在正文后作为独立图片发出,一次一个\n"
+    "   - 仅可使用名单内的名字;content 为 [NO_REPLY] 时表情仍会发出\n"
+    "   - 不需要每条消息都带,氛围合适时点缀即可\n"
+    "   - 可用表情: {EMOTICON_NAMES}\n"
     "\n"
     "## 聊天对象识别\n"
     "1. 与多个用户同时对话,需识别每个聊天对象,不是服务于单一用户。\n"
@@ -507,6 +512,21 @@ def register(ctx) -> None:
     logger.info(f"FoxBot2Hermes v{__version__} 启动")
     _install_cloud_link_autoswap()
     init_emoticons(EMOTICONS_DIR)
+    # 表情段按部署实际动态渲染(框架层保持人设中立、从简):
+    # 有表情 → 填入当前名单(只列真实存在的名字,防 AI 误用不存在的);
+    # 无表情 → 整段"3. 表情图片"从提示词中剥除,AI 不知道有这回事。
+    # 何时用表情、配什么语气属于人设,由 SOUL.md 自行发挥。
+    import re as _re
+    from .emoticons import list_emoticons
+    _names = list_emoticons()
+    global PLATFORM_HINT
+    if _names:
+        PLATFORM_HINT = PLATFORM_HINT.replace("{EMOTICON_NAMES}", ", ".join(_names))
+    else:
+        # 剥除整个"3. 表情图片(...)"块(到下一节"## 聊天对象识别"前)
+        PLATFORM_HINT = _re.sub(
+            r"3\. 表情图片\(.*?可用表情: \{EMOTICON_NAMES\}\n",
+            "", PLATFORM_HINT, flags=_re.S)
     # gateway 的用户授权是按 user_id 的(适合单聊平台),但群聊里每个群友
     # user_id 都不同,无法逐个列白名单。本插件的真正门禁是按群/私聊的白名单
     # (FOX_QQ_BOT_ALLOWED_GROUPS/FOX_QQ_BOT_ALLOWED_PRIVATE/FOX_QQ_BOT_ADMIN_QQ,在 engine 里执行),
