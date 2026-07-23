@@ -81,7 +81,10 @@ PLATFORM_HINT = (
     "QQ 平台协议规则:\n"
     "\n"
     "## 消息发送协议\n"
-    "1. 发言请优先通过 fox_qq_send_message 工具发出,可多次调用发送多条消息;引用/@人/表情/分段等效果只有工具能控制。\n"
+    "1. 发言请优先通过 fox_qq_send_message 工具发出;引用/@人/表情/分段等效果只有工具能控制。"
+    "content 支持字符串数组: 像真人聊天那样,把要说的话随意切成几条口语化短句按顺序放进数组,"
+    "一次性提交,后台会以自然的打字节奏逐条发出;一大段书面文字远不如几条短句像人。"
+    "发送是异步排队的,工具立即返回(拿不到消息ID),你下回合能在上下文里看到自己发出的消息。\n"
     "2. 建议调用工具时不附带正文,想说的话统一放入 fox_qq_send_message 的 content 参数;工具调用旁的正文是否会代发给用户取决于部署配置,不要依赖它说话,也不要在正文里写内心旁白。\n"
     "3. 最终文本回复仅允许两种标记:\n"
     "   - [NO_REPLY]: 表示流程结束,无需再发言,不调用任何工具直接回复本标记。也可以在正常完成最终回复后单独追加一行,或放在最后一次 fox_qq_send_message 的 content 末尾单独一行(标记行不会发出,仅作结束信号)。\n"
@@ -97,10 +100,11 @@ PLATFORM_HINT = (
     "\n"
     "## 引用与提醒规则\n"
     "1. 引用标记 [#reply@消息ID]:\n"
-    "   - 放在 fox_qq_send_message content 的最开头,且一条 content 里只能出现一次"
+    "   - 放在 content(数组时为某个元素)的最开头,每条内容里只能出现一次"
     "(正文中间的引用标记不生效,会被系统删除并提醒你)\n"
     "   - 用于引用指定消息(转为 QQ 引用效果,不显示在正文)\n"
-    "   - 需引用多条消息则多次调用工具发言,每次引用一条\n"
+    "   - 数组的每个元素是独立消息,可各自在开头放一个引用标记,"
+    "需引用多条消息时分放在不同元素即可\n"
     "   - 消息 ID 取自注入历史的 [msg_id#数字] 前缀\n"
     "   - 连续对同一人回答时,仅首次消息引用,后续消息不引用\n"
     "   - 同一用户连发的多条关联较大的消息,可只引用其中一条一并回答,"
@@ -528,8 +532,9 @@ def register(ctx) -> None:
             r"3\. 表情图片\(.*?可用表情: \{EMOTICON_NAMES\}\n",
             "", PLATFORM_HINT, flags=_re.S)
     # gateway 的用户授权是按 user_id 的(适合单聊平台),但群聊里每个群友
-    # user_id 都不同,无法逐个列白名单。本插件的真正门禁是按群/私聊的白名单
-    # (FOX_QQ_BOT_ALLOWED_GROUPS/FOX_QQ_BOT_ALLOWED_PRIVATE/FOX_QQ_BOT_ADMIN_QQ,在 engine 里执行),
+    # user_id 都不同,无法逐个列白名单。本插件的真正门禁是按群/私聊的黑白名单
+    # (FOX_QQ_BOT_ALLOWED_GROUPS/FOX_QQ_BOT_ALLOWED_PRIVATE 及对应 *_BLACKLIST/
+    # FOX_QQ_BOT_BLACKLIST_MODE/FOX_QQ_BOT_ADMIN_QQ,在 engine 里执行),
     # 所以默认让 gateway 这层按 user_id 的闸放行,用户无需手动配置。
     # 高级用户若确实想额外启用 gateway 的 user_id 过滤,可显式设
     # FOX_QQ_BOT_ALLOW_ALL_USERS=false + FOX_QQ_BOT_ALLOWED_USERS=<QQ号名单>。

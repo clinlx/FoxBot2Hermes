@@ -15,12 +15,15 @@ from collections.abc import Callable
 from . import qq_api
 from .config import (
     ADMIN_QQ,
-    ALLOWED_GROUPS,
-    ALLOWED_PRIVATE,
     BURST_DELAY,
     CTX_K,
-    GROUP_ALLOW_ALL_USERS,
     GROUP_ALLOWED_USERS,
+    GROUP_BLACKLIST,
+    GROUP_BLACKLIST_MODE,
+    GROUP_USER_BLACKLIST,
+    GROUP_USER_BLACKLIST_MODE,
+    PRIVATE_BLACKLIST,
+    PRIVATE_BLACKLIST_MODE,
     HEAT_ACC_RATIO,
     HEAT_ACCUMULATE,
     HEAT_DECAY_FACTOR,
@@ -48,6 +51,8 @@ from .config import (
     TK_STEP_MENTIONED,
     TK_TIMER_MULT,
     TRIGGER_QUEUE_LEN,
+    group_allowed,
+    private_allowed,
 )
 from .formatting import make_chat_id
 
@@ -139,15 +144,15 @@ class AdminCommandHandler:
             if not target.isdigit():
                 raise CommandFailed(f"目标号码无效: {target}")
             if ctype == "group":
-                if ALLOWED_GROUPS and target not in ALLOWED_GROUPS:
-                    raise CommandFailed(f"群 {target} 不在白名单内")
+                if not group_allowed(target):
+                    raise CommandFailed(f"群 {target} 未通过黑白名单准入")
                 st = self.engine.get_group_state(target)
                 tail = f"\n上下文队列保留({len(st.ctx)} 条),下次触发将注入新会话。"
             else:
-                # 与 engine._on_private_message 的放行门一致(管理员 ∪ 私聊白名单):
+                # 与 engine._on_private_message 的放行门同一套判定:
                 # 名单外的号码收不到任何私聊,建了状态只会成为永久垃圾
-                if target not in ADMIN_QQ and target not in ALLOWED_PRIVATE:
-                    raise CommandFailed(f"QQ {target} 不在私聊白名单内(也非管理员)")
+                if not private_allowed(target):
+                    raise CommandFailed(f"QQ {target} 未通过私聊黑白名单准入(也非管理员)")
                 st = self.engine.get_private_state(target)
                 tail = ""
         elif event.get("message_type") == "group":
@@ -174,8 +179,8 @@ class AdminCommandHandler:
         gid = args[0]
         if not gid.isdigit():
             raise CommandFailed(f"群号无效: {gid}")
-        if ALLOWED_GROUPS and gid not in ALLOWED_GROUPS:
-            raise CommandFailed(f"群 {gid} 不在白名单内")
+        if not group_allowed(gid):
+            raise CommandFailed(f"群 {gid} 未通过黑白名单准入")
         try:
             info = await qq_api.get_group_info(int(gid))
         except (TimeoutError, ConnectionError) as e:
@@ -203,6 +208,11 @@ class AdminCommandHandler:
             lines.append(f"NapCat: 调用失败({type(e).__name__}: {e})")
         lines.append(
             f"群状态: {len(self.engine.group_states)} 个;私聊状态: {len(self.engine.private_states)} 个")
+        def _mode(m: bool) -> str:
+            return "黑名单模式(默认放行)" if m else "白名单模式(默认拒绝)"
+        lines.append(
+            f"准入: 群 {_mode(GROUP_BLACKLIST_MODE)},私聊 {_mode(PRIVATE_BLACKLIST_MODE)}"
+            f";群黑名单 {len(GROUP_BLACKLIST)} 个,私聊黑名单 {len(PRIVATE_BLACKLIST)} 人")
         return "\n".join(lines)
 
     async def _cmd_heat(self, event: dict, args: list[str]) -> str:
@@ -241,7 +251,9 @@ class AdminCommandHandler:
             f"定时触发概率: {timer_p:.2f} @热度 {timer_rate:.2f}(TK×{TK_TIMER_MULT:g}, 曲线: {TIMER_PROB_CURVE}){timer_note}\n"
             f"消息触发概率: {msg_p:.2f} @热度 {msg_rate:.2f}(TK×{TK_MSG_MULT:g}, 曲线: {MSG_PROB_CURVE})\n"
             f"关键词: {len(KEYWORD_TRIGGERS)} 个\n"
-            f"成员放行: {'全员' if GROUP_ALLOW_ALL_USERS else f'名单 {len(GROUP_ALLOWED_USERS)} 人 + 管理员'}\n"
+            f"成员放行: {'黑名单模式(默认放行)' if GROUP_USER_BLACKLIST_MODE else '白名单模式(默认拒绝)'}"
+            f"(本群生效白名单 {len(GROUP_ALLOWED_USERS.get('all', set()) | GROUP_ALLOWED_USERS.get(group_id, set()))} 人"
+            f"/黑名单 {len(GROUP_USER_BLACKLIST.get('all', set()) | GROUP_USER_BLACKLIST.get(group_id, set()))} 人)\n"
             f"上下文队列: {len(st.ctx)}/{CTX_K} (R={st.since})\n"
             f"待处理触发: {len(st.pending)}/{TRIGGER_QUEUE_LEN}" + ("(处理中)" if st.processing else "") + "\n"
             f"取件冷却剩余: {max(0.0, st.ready_at - now):.1f}s (T1={PROCESS_DELAY:g}s/T2={BURST_DELAY:g}s)\n"

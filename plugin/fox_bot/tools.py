@@ -2,16 +2,19 @@
 
 TOOL_SPECS 为注册清单(name/description/schema/handler),扩展加条目即可。
 全部 handler:
-- 带群/私聊目标的工具做白名单硬约束: target_id ∈ ALLOWED_GROUPS/ALLOWED_PRIVATE,
-  越界返回错误(fox_qq_get_history 同样受限,防跨群窥屏),不依赖提示词;
-  按 message_id 操作的工具(OCR/表情回应/撤回)的消息本就来自白名单会话;
+- 带群/私聊目标的工具做黑白名单硬约束: target_id 须通过 group_allowed/
+  private_allowed 准入(与入站门同一套判定),越界返回错误
+  (fox_qq_get_history 同样受限,防跨群窥屏),不依赖提示词;
+  按 message_id 操作的工具(OCR/表情回应/撤回)的消息本就来自已放行会话;
 - target_id 省略时回退当前会话目标(handler 从 context 取 chat_id 解析);
 - 返回 JSON 原生 dict: 成功 {"success": true, ...},失败 {"error": "..."}。
 
-fox_qq_send_message 是出站唯一出口: 完整后处理([#reply@ID]/降级/分段/图片附发)
-+ 发送成功记 [bot] 行入上下文队列。
+fox_qq_send_message 是出站唯一出口: 完整后处理([#reply@ID]/降级/分段/图片附发)。
+content 支持字符串数组(短句列表),打包为队列项交 engine 按会话发送队列
+拟人节奏逐条发出,工具瞬间返回;[bot] 行在每条实际发出时刻记入上下文队列。
 """
 
+import asyncio
 import base64
 import logging
 import os
@@ -22,18 +25,18 @@ from . import qq_api, sandboxfs
 from .emoticons import is_registry_path as is_registry_emoticon, resolve_emoticon
 from .mediastore import MEDIA_MAX_BYTES, seg_marker, store as media_store
 from .config import (
-    ADMIN_QQ,
-    ALLOWED_GROUPS,
-    ALLOWED_PRIVATE,
     DEBUG_REPLY,
     IMAGE_DEFAULT,
     IMAGE_PROVIDERS,
     MEDIA_MAX_MB,
     OCR_BACKEND,
     RESOLVE_AT,
+    SEND_QUEUE_MAX,
     TMP_DIR,
     TOOL_OCR,
     TOOL_STT,
+    group_allowed,
+    private_allowed,
 )
 from .formatting import (
     ensure_reply_at,
@@ -83,13 +86,12 @@ def _resolve_target(channel_type: str | None, target_id: str | None,
         target_id = target_id or target
     target_id = str(target_id).strip()
     if channel_type == "group":
-        if ALLOWED_GROUPS and target_id not in ALLOWED_GROUPS:
+        if not group_allowed(target_id):
             return {"error": f"群 {target_id} 不在许可范围"}
     elif channel_type == "private":
-        # 与入站门(engine._on_private_message)保持一致: 管理员永远允许私聊,
+        # 与入站门(engine._on_private_message)同一套判定: 管理员永远允许私聊,
         # 否则能收到管理员消息却无法回信(工具/碎碎念代发全被自己拦下)
-        if ALLOWED_PRIVATE and target_id not in ALLOWED_PRIVATE \
-                and target_id not in ADMIN_QQ:
+        if not private_allowed(target_id):
             return {"error": f"用户 {target_id} 不在许可范围"}
     else:
         return {"error": f"channel_type 无效: {channel_type}(应为 group/private)"}
@@ -99,47 +101,77 @@ def _resolve_target(channel_type: str | None, target_id: str | None,
 
 
 async def tool_send_message(args: dict, context: dict | None = None) -> dict:
-    """发送 QQ 消息(出站唯一出口)。"""
+    """发送 QQ 消息(出站唯一出口)。
+
+    content 支持字符串或字符串数组(短句列表): 全部内容在此完成后处理
+    (引用/@解析/分段/图片提取),打包成队列项交给 engine 的按会话发送队列,
+    工具瞬间返回不等实际发出(拟人节奏由后台发送循环控制);
+    引擎未绑定(单测/降级)时原地逐条直发。异步排队后本回合拿不到消息 ID。
+    """
     current_chat_id = (context or {}).get("chat_id")
-    content = str(args.get("content") or "")
+    raw = args.get("content")
+    contents = [str(x) for x in raw] if isinstance(raw, list) else [str(raw or "")]
     emoticon = str(args.get("emoticon") or "").strip()
 
-    # agent 用工具发 NO_REPLY: 视为本轮结束信号,不真的发出去;
-    # 但带了表情时,表情仍然发送一次,之后照常结束回合
-    if is_turn_end(content):
-        emo_result: dict | None = None
+    # NO_REPLY 结束信号提取: 纯标记的条目剥离并置结束标志(不真的发出去);
+    # 最后一条正文末尾单独成行的 [NO_REPLY] 同样剥离(与裸回复路径对齐)
+    end_after_send = False
+    texts: list[str] = []
+    for c in contents:
+        if is_turn_end(c):
+            end_after_send = True
+            continue
+        if c.strip():
+            texts.append(c)
+    if texts:
+        texts[-1], tail_end = split_end_marker(texts[-1])
+        end_after_send = end_after_send or tail_end
+        if not texts[-1].strip():
+            texts.pop()
+
+    resolved = _resolve_target(args.get("channel_type"), args.get("target_id"),
+                               current_chat_id)
+
+    # 纯结束信号(可带表情): 表情照常入队,回合立即结束
+    if not texts and end_after_send:
+        result: dict = {"success": True, "turn_ended": True}
         if emoticon:
-            resolved = _resolve_target(args.get("channel_type"),
-                                       args.get("target_id"), current_chat_id)
-            if not isinstance(resolved, dict):
-                emo_result = await _send_emoticon(*resolved, emoticon)
+            if isinstance(resolved, dict):
+                result["emoticon_error"] = resolved["error"]
+            else:
+                emo_item = _build_emoticon_item(emoticon)
+                if isinstance(emo_item, dict) and "error" in emo_item:
+                    result["emoticon_error"] = emo_item["error"]
+                else:
+                    await _dispatch_items(*resolved, [emo_item])
         logger.info(f"[send] NO_REPLY via tool → 结束回合 chat={current_chat_id!r}"
                     f" emoticon={bool(emoticon)}")
         if _engine is not None:
             _engine.mark_turn_end(current_chat_id)
-        out: dict = {"success": True, "turn_ended": True}
-        if emo_result is not None and "error" in emo_result:
-            out["emoticon_error"] = emo_result["error"]
-        return out
+        return result
 
-    # 正文末尾单独成行的 [NO_REPLY]: 与裸回复路径(split_end_marker)对齐——
-    # 剥掉标记正常发送正文,发完顺带结束回合,标记本身绝不发进 QQ
-    content, end_after_send = split_end_marker(content)
-
-    resolved = _resolve_target(args.get("channel_type"), args.get("target_id"),
-                               current_chat_id)
     if isinstance(resolved, dict):
         logger.info(f"[send] 目标解析失败 chat={current_chat_id!r}: {resolved['error']}")
         return resolved
     ctype, target = resolved
-    if not content.strip():
+    if not texts and not emoticon:
         return {"error": "content 为空"}
 
-    reply_to, segments, image_url, reply_stripped = prepare_outgoing(content)
-    logger.info(f"[send] → {ctype}:{target} segs={len(segments)} "
-                f"reply_to={reply_to} image={bool(image_url)}"
-                + (f" 剥除中间引用标记={reply_stripped}" if reply_stripped else ""))
-    if not segments and not image_url:
+    # 单次调用条数上限: 超出截断,返回中提醒(防 AI 一口气塞爆队列)
+    truncated = 0
+    if len(texts) > SEND_QUEUE_MAX:
+        truncated = len(texts) - SEND_QUEUE_MAX
+        texts = texts[:SEND_QUEUE_MAX]
+
+    # 每条内容独立过出站管线(各自可带一个开头引用标记,是独立的 QQ 消息)
+    prepared: list[tuple] = []      # (reply_to, segments, image_url)
+    reply_stripped_total = 0
+    for t in texts:
+        reply_to, segments, image_url, stripped = prepare_outgoing(t)
+        reply_stripped_total += stripped
+        if segments or image_url:
+            prepared.append((reply_to, segments, image_url))
+    if not prepared and not emoticon:
         return {"error": "内容经格式处理后为空,未发送"}
 
     # 群聊: 拉成员表用于假 @名字 → 真 at 段解析(私聊无 @ 概念)
@@ -155,8 +187,9 @@ async def tool_send_message(args: dict, context: dict | None = None) -> dict:
     bad_ats: set[str] = set()
     if members:
         unknown: set[str] = set()
-        for seg_text in segments:
-            unknown.update(resolve_at(seg_text, members)[1])
+        for _, segments, _ in prepared:
+            for seg_text in segments:
+                unknown.update(resolve_at(seg_text, members)[1])
         if unknown:
             try:
                 refreshed = await _engine.refresh_group_members(target)
@@ -172,24 +205,20 @@ async def tool_send_message(args: dict, context: dict | None = None) -> dict:
                 logger.info(f"[send] @到不存在的 QQ号(保留原文,仅警告) "
                             f"group={target}: {sorted(bad_ats)}")
 
-    # 引用回复但正文没 @ 到被引作者时,自动补一个真 @(仅群聊)
-    reply_sender: str | None = None
-    if ctype == "group" and reply_to is not None:
-        try:
-            data = await qq_api.get_msg(reply_to)
-            reply_sender = str(((data or {}).get("sender") or {}).get("user_id") or "") or None
-        except Exception:
-            logger.warning(f"取被引消息作者失败,跳过自动 @ reply_to={reply_to}")
-
-    last_message_id: Any = None
-    sent_texts: list[str] = []
-    at_others = reply_to is not None  # 引用别人也算"主动@别人"
-    
-    if DEBUG_REPLY:
-        logger.debug(f"[reply] 分段发送 chat={ctype}/{target} 段数={len(segments)} "
-                     f"reply_to={reply_to} image={bool(image_url)} emoticon={bool(emoticon)}")
-    
-    try:
+    # 组装队列项
+    items: list[dict] = []
+    at_others = False
+    for reply_to, segments, image_url in prepared:
+        # 引用回复但正文没 @ 到被引作者时,自动补一个真 @(仅群聊)
+        reply_sender: str | None = None
+        if ctype == "group" and reply_to is not None:
+            at_others = True  # 引用别人也算"主动@别人"
+            try:
+                data = await qq_api.get_msg(reply_to)
+                reply_sender = str(((data or {}).get("sender") or {})
+                                   .get("user_id") or "") or None
+            except Exception:
+                logger.warning(f"取被引消息作者失败,跳过自动 @ reply_to={reply_to}")
         for i, seg_text in enumerate(segments):
             message: list = []
             if i == 0 and reply_to is not None:
@@ -198,73 +227,127 @@ async def tool_send_message(args: dict, context: dict | None = None) -> dict:
                 at_segs = resolve_at(seg_text, members)[0]
             else:
                 at_segs = [qq_api.seg_text(seg_text)]
-            # 只在首段补引用作者的 @(整条消息一个引用、一个补 @ 足矣)
+            # 只在首段补引用作者的 @(一条消息一个引用、一个补 @ 足矣)
             if i == 0 and reply_sender:
                 bot_qq = getattr(_engine, "self_id", None)
                 at_segs = ensure_reply_at(at_segs, reply_sender, bot_qq)
             if any(s.get("type") == "at" for s in at_segs):
                 at_others = True
             message.extend(at_segs)
-            
-            if DEBUG_REPLY:
-                import json
-                msg_repr = json.dumps(message, ensure_ascii=False)[:300]
-                logger.debug(f"[reply] 段{i+1}/{len(segments)} segs={len(message)} "
-                             f"content={msg_repr}")
-            
-            try:
-                data = await _send(ctype, target, message)
-            except Exception:
-                if i == 0 and reply_to is not None:
-                    # 引用目标可能无效: 去掉 reply 段降级重试
-                    # (保留 @ 解析结果与自动补的引用作者 @)
-                    logger.warning(f"引用发送失败,降级为普通发送 reply_to={reply_to}")
-                    data = await _send(ctype, target, at_segs)
-                else:
-                    raise
-            last_message_id = (data or {}).get("message_id")
-            sent_texts.append(seg_text)
+            items.append({"kind": "msg", "message": message, "text": seg_text,
+                          # 引用目标可能无效: 发送失败时去掉 reply 段降级重发
+                          "fallback": at_segs if (i == 0 and reply_to is not None) else None})
         if image_url:
-            data = await _send(ctype, target,
-                               [qq_api.seg_image(await _swap_internal(image_url))])
-            last_message_id = (data or {}).get("message_id") or last_message_id
-    except Exception as e:
-        logger.exception("fox_qq_send_message 发送失败")
-        # 已发出的部分仍入上下文队列
-        _note_sent(ctype, target, sent_texts)
-        return {"error": f"发送失败: {type(e).__name__}: {e}",
-                "sent_segments": len(sent_texts)}
+            items.append({"kind": "image", "url": image_url})
 
-    _note_sent(ctype, target, sent_texts)
-    # 主动@别人/引用别人 → 抬升临时热度(一次发送只计一次,与人数无关)
+    result = {"success": True, "queued": len(items)}
+    if emoticon:
+        emo_item = _build_emoticon_item(emoticon)
+        if isinstance(emo_item, dict) and "error" in emo_item:
+            result["emoticon_error"] = emo_item["error"]
+        else:
+            items.append(emo_item)
+            result["emoticon_queued"] = True
+
+    replied = sum(1 for r, _, _ in prepared if r is not None)
+    logger.info(f"[send] → {ctype}:{target} 队列项={len(items)} "
+                f"(条目 {len(prepared)},引用 {replied},截断 {truncated})"
+                + (f" 剥除多余引用标记={reply_stripped_total}" if reply_stripped_total else ""))
+    if DEBUG_REPLY:
+        logger.debug(f"[reply] chat={ctype}/{target} items="
+                     + ",".join(it["kind"] for it in items))
+
+    # 主动@别人/引用别人 → 抬升临时热度(一次调用只计一次,与人数无关)
     if at_others and ctype == "group" and _engine is not None:
         _engine.note_bot_at_others(target)
-    result: dict = {"success": True, "message_id": last_message_id,
-                    "segments": len(segments) + (1 if image_url else 0)}
+
+    err = await _dispatch_items(ctype, target, items)
+    if err is not None:
+        return err
+
+    if truncated:
+        result["truncated_warning"] = (
+            f"content 数组超过单次上限 {SEND_QUEUE_MAX} 条,"
+            f"已丢弃末尾 {truncated} 条未发送。请更精炼,或分多次调用。")
     if bad_ats:
         result["warning"] = _bad_at_warning(bad_ats)
-    if reply_stripped:
+    if reply_stripped_total:
         result["reply_mark_warning"] = (
-            f"提醒: 正文中出现了 {reply_stripped} 个额外的 [#reply@消息ID] 标记,"
-            "已自动删除(未显示给用户)。引用标记只能出现一次且必须放在 content"
-            " 最开头;想引用多条消息请分多次调用本工具,每次引用一条。")
-    
-    # 发送表情(在正文全部发送完成后,独立一条消息)
-    if emoticon:
-        emo_result = await _send_emoticon(ctype, target, emoticon)
-        if "error" in emo_result:
-            result["emoticon_error"] = emo_result["error"]
-        else:
-            result["emoticon_sent"] = True
+            f"提醒: 正文中出现了 {reply_stripped_total} 个位置不对的 [#reply@消息ID] 标记,"
+            "已自动删除(未显示给用户)。引用标记必须放在某条内容的最开头;"
+            "content 数组的每个元素是独立消息,可以各自在开头放一个引用标记。")
 
-    # 正文携带的末行 [NO_REPLY]: 发送成功才结束回合(失败时保留回合让 AI 重试)
+    # 末尾携带 [NO_REPLY]: 入队成功即结束回合(实际发送由后台队列完成)
     if end_after_send:
-        logger.info(f"[send] 正文末行携带 NO_REPLY → 发送成功,结束回合 chat={current_chat_id!r}")
+        logger.info(f"[send] 正文末行携带 NO_REPLY → 已入队,结束回合 chat={current_chat_id!r}")
         if _engine is not None:
             _engine.mark_turn_end(current_chat_id)
         result["turn_ended"] = True
 
     return result
+
+
+def _build_emoticon_item(emoticon: str) -> dict:
+    """表情队列项: 入队前先解析一次表情名,无效名称立即报错给 AI 纠正。"""
+    resolved_emo = resolve_emoticon(emoticon)
+    if isinstance(resolved_emo, dict):
+        logger.warning(f"[send_emoticon] 表情解析失败: {resolved_emo.get('error')}")
+        return resolved_emo
+    return {"kind": "emoticon", "name": emoticon}
+
+
+async def _dispatch_items(ctype: str, target: str, items: list[dict]) -> dict | None:
+    """队列项分发: 引擎可用即入队瞬回;否则原地逐条直发(单测/降级路径)。
+
+    返回 None 表示成功受理;返回 {"error": ...} 表示直发路径失败。
+    """
+    if not items:
+        return None
+    enqueue = getattr(_engine, "enqueue_outgoing", None) if _engine is not None else None
+    if enqueue is not None:
+        try:
+            enqueue(ctype, target, items)
+            return None
+        except Exception:
+            logger.exception("[send] 入队失败,降级为原地直发")
+    sent = 0
+    try:
+        for it in items:
+            await deliver_item(ctype, target, it)
+            sent += 1
+    except Exception as e:
+        logger.exception("fox_qq_send_message 直发失败")
+        return {"error": f"发送失败: {type(e).__name__}: {e}", "sent_segments": sent}
+    return None
+
+
+async def deliver_item(ctype: str, target: str, item: dict) -> None:
+    """发送单个队列项(engine._sender_loop 与无引擎直发路径共用)。
+
+    msg/image 失败抛异常(由调用方决定重试/丢弃);emoticon 失败只记日志
+    (表情是点缀,不值得为它触发"丢弃剩余"或管理员告警)。
+    发送成功的 msg 项在此刻记 [bot] 行入上下文——顺序与群里真实所见一致。
+    """
+    kind = item.get("kind")
+    if kind == "emoticon":
+        emo_result = await _send_emoticon(ctype, target, item["name"])
+        if "error" in emo_result:
+            logger.warning(f"[sendq] 表情发送失败(跳过): {emo_result['error']}")
+        return
+    if kind == "image":
+        await _send(ctype, target,
+                    [qq_api.seg_image(await _swap_internal(item["url"]))])
+        return
+    try:
+        await _send(ctype, target, item["message"])
+    except Exception:
+        fallback = item.get("fallback")
+        if not fallback:
+            raise
+        # 引用目标可能无效: 去掉 reply 段降级重试(保留 @ 解析与补 @ 结果)
+        logger.warning("[sendq] 引用发送失败,降级为普通发送")
+        await _send(ctype, target, fallback)
+    _note_sent(ctype, target, [item["text"]])
 
 
 async def relay_chatter(chat_id: str, content: str) -> dict:
@@ -297,6 +380,33 @@ async def _send(ctype: str, target: str, message: list) -> Any:
     if ctype == "group":
         return await qq_api.send_group_msg(int(target), message)
     return await qq_api.send_private_msg(int(target), message)
+
+
+async def _wait_outbound_drain(ctype: str, target: str) -> None:
+    """等待该会话发送队列清空(跨事件循环安全,失败静默放行)。
+
+    图片/文件等直发工具在发送前调用: 防止排队中的正文还没发完,
+    图片先落地造成顺序倒挂("如图"比图先到)。
+    """
+    eng = _engine
+    wait = getattr(eng, "wait_send_drain", None) if eng is not None else None
+    loop = getattr(eng, "_loop", None) if eng is not None else None
+    if wait is None or loop is None:
+        return
+    try:
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            await wait(ctype, target)
+        else:
+            # 工具跑在独立线程循环: 队列的 Event 属于引擎循环,
+            # 必须经 run_coroutine_threadsafe 投递过去等
+            fut = asyncio.run_coroutine_threadsafe(wait(ctype, target), loop)
+            await asyncio.wrap_future(fut)
+    except Exception:
+        logger.warning("[send] 等待发送队列清空失败,直接继续", exc_info=True)
 
 
 async def _swap_internal(url: str) -> str:
@@ -517,6 +627,8 @@ async def tool_send_image(args: dict, context: dict | None = None) -> dict:
     image = str(args.get("image") or "").strip()
     if not image:
         return {"error": "image 为空"}
+    # 排队中的正文先落地再发图,防"如图"比图后到
+    await _wait_outbound_drain(ctype, target)
     image = await _swap_internal(image)
     caption = str(args.get("caption") or "").strip()
 
@@ -582,6 +694,8 @@ async def tool_send_file(args: dict, context: dict | None = None) -> dict:
     name = str(args.get("name") or "").strip()
     if not file or not name:
         return {"error": "file/name 不能为空"}
+    # 排队中的正文先落地再发文件(保持消息顺序)
+    await _wait_outbound_drain(ctype, target)
     file = await _swap_internal(file)
 
     prepared = await _prepare_local(file)
@@ -884,19 +998,30 @@ TOOL_SPECS: list[dict] = [
     {
         "name": "fox_qq_send_message",
         "description": (
-            "发送 QQ 消息(你对用户发言的唯一途径)。content 为纯文本;"
-            "要引用某条消息时把 [#reply@消息ID] 放在 content 最开头。"
+            "发送 QQ 消息(你对用户发言的唯一途径)。content 为纯文本,"
+            "支持字符串数组: 像真人聊天那样把话切成几条口语化短句,"
+            "按顺序放进数组一次性提交——后台会以自然的间隔逐条发出,"
+            "比一大段更像人。数组每个元素是独立的一条 QQ 消息,"
+            "要引用某条消息时把 [#reply@消息ID] 放在该元素最开头(可各自引用)。"
             "要提醒用户时把 @QQ号 放在内容开头(QQ号取自消息前缀的 qq_id@,不是 msg_id#)。"
             "超长内容自动分段,内容里的图片 URL 自动转为图片附发。"
-            "可多次调用发多条消息。"
+            "发送为异步排队,工具立即返回,本回合拿不到消息ID"
+            "(下回合上下文里能看到自己发的消息)。"
             "发送时附加你自身的独特风格和人设。"
-            "可选的 emoticon 字段用于在消息后附带表情图片(单独一条消息)。"
+            "可选的 emoticon 字段用于在全部内容后附带表情图片(单独一条消息)。"
         ),
         "schema": {
             "type": "object",
             "properties": {
                 **_TARGET_PROPS,
-                "content": {"type": "string", "description": "要发送的文本内容"},
+                "content": {
+                    "type": ["string", "array"],
+                    "items": {"type": "string"},
+                    "description": (
+                        "要发送的文本内容。推荐传字符串数组: 每个元素一条短句,"
+                        "按数组顺序以拟人节奏逐条发出;传单个字符串等同单元素数组。"
+                    ),
+                },
                 "emoticon": {
                     "type": "string",
                     "description": (

@@ -25,7 +25,6 @@ from .mediastore import seg_marker, store as media_store
 from .config import (
     ADMIN_QQ,
     ALLOWED_GROUPS,
-    ALLOWED_PRIVATE,
     BOT_NAME_MENTION_RE,
     BOT_QQ,
     BURST_DELAY,
@@ -54,8 +53,6 @@ from .config import (
     FRIEND_AUTO_ACCEPT,
     FRIEND_GREET_DELAY,
     FRIEND_PROMPT_PATH,
-    GROUP_ALLOW_ALL_USERS,
-    GROUP_ALLOWED_USERS,
     GROUP_PROMPT_PATH,
     CUT_LINE,
     HEAT_ACC_RATIO,
@@ -89,6 +86,9 @@ from .config import (
     PROCESS_DELAY,
     PROTOCOL_RETRY,
     QUEUE_MERGE,
+    SEND_DRAIN_TIMEOUT,
+    SEND_INTERVAL,
+    SEND_JITTER,
     SHARED_COOLDOWN,
     STATE_FILE,
     STATE_SAVE_INTERVAL,
@@ -106,6 +106,9 @@ from .config import (
     TURN_TIMEOUT,
     USER_COOLDOWN,
     WAKE_PROMPT_PATH,
+    group_allowed,
+    group_user_allowed,
+    private_allowed,
 )
 from .formatting import (
     is_continue_think,
@@ -417,7 +420,7 @@ def validate_cron_tasks(tasks: list) -> tuple[list[dict], list[str]]:
 
     合法项: {"name", "spec"(CronSpec), "prompt", "ctype", "target"}。
     校验点: schedule 可解析且非空、prompt 非空串、target 形如
-    group:<群号>/private:<QQ号> 且在对应白名单内。不合格的项不启动。
+    group:<群号>/private:<QQ号> 且通过对应黑白名单准入。不合格的项不启动。
     """
     valid: list[dict] = []
     errors: list[str] = []
@@ -444,12 +447,11 @@ def validate_cron_tasks(tasks: list) -> tuple[list[dict], list[str]]:
             errors.append(f"{label}: target {target_raw!r} 非法,"
                           "须为 group:<群号> 或 private:<QQ号>")
             continue
-        if ctype == "group" and ALLOWED_GROUPS and target not in ALLOWED_GROUPS:
-            errors.append(f"{label}: 群 {target} 不在白名单")
+        if ctype == "group" and not group_allowed(target):
+            errors.append(f"{label}: 群 {target} 未通过黑白名单准入")
             continue
-        if ctype == "private" and ALLOWED_PRIVATE and target not in ALLOWED_PRIVATE \
-                and target not in ADMIN_QQ:
-            errors.append(f"{label}: 用户 {target} 不在私聊白名单")
+        if ctype == "private" and not private_allowed(target):
+            errors.append(f"{label}: 用户 {target} 未通过私聊黑白名单准入")
             continue
         valid.append({"name": name, "spec": spec, "prompt": prompt.strip(),
                       "ctype": ctype, "target": target})
@@ -657,10 +659,21 @@ class QQEngine:
         self._friend_flags_seen: set[str] = set()
         # 未触发的新好友问候定时器: user_id -> Task(对方先开口即取消)
         self._greet_tasks: dict[str, asyncio.Task] = {}
+        # 出站发送队列(按会话隔离,拟人节奏): key = "group:111"/"private:333"
+        self._send_queues: dict[str, deque[dict]] = {}
+        self._send_tasks: dict[str, asyncio.Task] = {}
+        self._send_idle: dict[str, asyncio.Event] = {}   # 队列清空且无发送在途时置位
+        self._send_last: dict[str, float] = {}           # 上次实际发出时刻(monotonic)
+        # 发送循环所在事件循环(工具可能跑在独立线程循环,入队须跨循环投递)
+        try:
+            self._loop: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
+        except RuntimeError:
+            self._loop = None
 
     # ---- 生命周期 ----
 
     async def start(self) -> None:
+        self._loop = asyncio.get_running_loop()
         check_prompt_files()
         self._clean_tmp_dir()  # 清空上次运行残留的临时文件(取消/崩溃遗留)
         # 时钟自检(后台,不阻塞启动): 时钟漂移会让 NapCat 送达确认失灵,
@@ -707,6 +720,14 @@ class QQEngine:
             if state.worker is not None and not state.worker.done():
                 state.worker.cancel()
             state.worker = None
+        # 出站发送队列: 取消发送循环,清空队列,唤醒所有等待者(防停机卡死)
+        for t in self._send_tasks.values():
+            if not t.done():
+                t.cancel()
+        self._send_tasks.clear()
+        self._send_queues.clear()
+        for ev in self._send_idle.values():
+            ev.set()
         await media_store.stop()
         self.save_states()
         self.save_members()  # 保存成员缓存
@@ -905,6 +926,8 @@ class QQEngine:
         await asyncio.sleep(5)
         now = time.monotonic()
         for group_id in ALLOWED_GROUPS:
+            if not group_allowed(group_id):   # 白名单里但被黑名单踢掉的群不预取
+                continue
             entry = self._group_members.get(group_id)
             if entry and now - entry["at"] < MEMBER_CACHE_TTL:
                 continue  # 缓存仍有效,跳过
@@ -997,6 +1020,9 @@ class QQEngine:
                 ev = state.pending.popleft()
             state.processing = True
             try:
+                # 上一批排队消息还没发完时先等它清空(封顶 SEND_DRAIN_TIMEOUT):
+                # 保证注入的上下文里含有 AI 自己完整的发送历史
+                await self.wait_send_drain(*label.split("-", 1))
                 await process(ev)
             except Exception:
                 exc_text = traceback.format_exc()
@@ -1051,6 +1077,112 @@ class QQEngine:
                     await qq_api.send_private_msg(int(admin_qq), admin_msg)
                 except Exception:
                     logger.exception(f"管理员错误通知发送失败 admin={admin_qq}")
+
+    # ---- 出站发送队列(拟人节奏) ----
+    # fox_qq_send_message 把内容拆成队列项(tools 侧完成 @解析/引用/分段等准备)
+    # 后经 enqueue_outgoing 入队瞬间返回;每个会话一条队列 + 一个发送循环:
+    # 第一条秒发,后续每条间隔 SEND_INTERVAL + rand(0, SEND_JITTER) 秒。
+    # 失败语义: 单条重试一次,仍失败则丢弃该会话队列剩余全部条目
+    # (NapCat 挂了后面的也发不出去,发半截更语无伦次),通知管理员并
+    # 记 pending_sys_notes 下回合告知 AI。
+
+    def enqueue_outgoing(self, ctype: str, target: str, items: list[dict]) -> None:
+        """入队待发送项(跨事件循环安全;工具线程可直接调用)。"""
+        loop = self._loop
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if loop is None or loop.is_closed():
+            self._loop = loop = running
+        if loop is None:
+            raise RuntimeError("发送队列不可用: 引擎事件循环未就绪")
+        if running is loop:
+            self._enqueue_local(ctype, target, items)
+        else:
+            loop.call_soon_threadsafe(self._enqueue_local, ctype, target, items)
+
+    def _enqueue_local(self, ctype: str, target: str, items: list[dict]) -> None:
+        key = f"{ctype}:{target}"
+        q = self._send_queues.setdefault(key, deque())
+        q.extend(items)
+        self._send_idle.setdefault(key, asyncio.Event()).clear()
+        t = self._send_tasks.get(key)
+        if t is None or t.done():
+            self._send_tasks[key] = asyncio.create_task(
+                self._sender_loop(key, ctype, target))
+        logger.info(f"[sendq] 入队 {len(items)} 项 chat={key} 队列={len(q)}")
+
+    async def _sender_loop(self, key: str, ctype: str, target: str) -> None:
+        """单会话发送循环: 逐条取件发送,项间拟人间隔;结束时必置 idle 事件。"""
+        from . import tools  # 延迟导入避免循环依赖
+        q = self._send_queues.get(key)
+        try:
+            while q:
+                # 与上一条实际发出的间隔不足时补足(跨调用也保持节奏;
+                # 长时间没发过则无需等待,首条秒发)
+                gap = SEND_INTERVAL + random.uniform(0.0, max(0.0, SEND_JITTER))
+                wait = self._send_last.get(key, float("-inf")) + gap - time.monotonic()
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                if not q:
+                    break
+                item = q[0]
+                try:
+                    try:
+                        await tools.deliver_item(ctype, target, item)
+                    except Exception as e:
+                        logger.warning(f"[sendq] 发送失败,1s 后重试一次 chat={key}: "
+                                       f"{type(e).__name__}: {e}")
+                        await asyncio.sleep(1.0)
+                        await tools.deliver_item(ctype, target, item)
+                except Exception as e:
+                    dropped = len(q)
+                    q.clear()
+                    logger.exception(f"[sendq] 重试仍失败,丢弃队列剩余 {dropped} 项 chat={key}")
+                    await self._on_sendq_failure(ctype, target, dropped, e)
+                    break
+                q.popleft()
+                self._send_last[key] = time.monotonic()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # 循环自身异常(理论不可达): 清队防止 drain 等待者被卡
+            logger.exception(f"[sendq] 发送循环异常退出 chat={key}")
+            if q:
+                q.clear()
+        finally:
+            ev = self._send_idle.get(key)
+            if ev is not None:
+                ev.set()
+
+    async def _on_sendq_failure(self, ctype: str, target: str,
+                                dropped: int, exc: Exception) -> None:
+        brief = f"发送队列失败,丢弃剩余 {dropped} 条"
+        await self._notify_error(f"{ctype}-{target}", brief,
+                                 f"{type(exc).__name__}: {exc}")
+        state = self._find_state(ctype, target)
+        if state is not None:
+            state.pending_sys_notes.append(
+                f"你上回合排队发送的消息有 {dropped} 条发送失败被丢弃,用户没有看到它们;"
+                "如有必要请酌情重新表达(不必逐字重发)")
+
+    async def wait_send_drain(self, ctype: str, target: str) -> bool:
+        """等待该会话发送队列清空(封顶 SEND_DRAIN_TIMEOUT);返回是否真的清空。
+
+        新回合取件前调用: 让 AI 的上一批消息全部落地、[bot] 行齐全后再取
+        上下文。超时放行——宁可上下文缺几条自己的话,不能卡死整个会话。
+        """
+        ev = self._send_idle.get(f"{ctype}:{target}")
+        if ev is None or ev.is_set():
+            return True
+        try:
+            await asyncio.wait_for(ev.wait(), SEND_DRAIN_TIMEOUT)
+            return True
+        except asyncio.TimeoutError:
+            logger.warning(f"[sendq] 等待队列清空超时({SEND_DRAIN_TIMEOUT:g}s),"
+                           f"直接开始处理 chat={ctype}:{target}")
+            return False
 
     # ---- 回合协议(出站) ----
 
@@ -1349,7 +1481,7 @@ class QQEngine:
         user_id = str(event.get("user_id", ""))       # 被撤消息的作者
         if ntype == "group_recall":
             group_id = str(event.get("group_id", ""))
-            if ALLOWED_GROUPS and group_id not in ALLOWED_GROUPS:
+            if not group_allowed(group_id):
                 return
             st = self.group_states.get(group_id)
             if st is None:
@@ -1372,7 +1504,7 @@ class QQEngine:
             st.ctx_seq += 1
         else:
             # 私聊撤回: user_id 即对方(自己撤自己;机器人消息被撤不会上报此类型)
-            if user_id not in ADMIN_QQ and user_id not in ALLOWED_PRIVATE:
+            if not private_allowed(user_id):
                 return
             pst = self.private_states.get(user_id)
             if pst is None:
@@ -1386,19 +1518,21 @@ class QQEngine:
         user_id = str(event.get("user_id", ""))
         if DEBUG_TRIGGER:
             logger.info(f"[group-msg] 收到 group={group_id} user={user_id} self_id={self.self_id}")
-        if ALLOWED_GROUPS and group_id not in ALLOWED_GROUPS:
+        if not group_allowed(group_id):
             if DEBUG_TRIGGER:
-                logger.info(f"[trigger] 群不在白名单,忽略 group={group_id} 白名单={sorted(ALLOWED_GROUPS)}")
+                logger.info(f"[trigger] 群未通过黑白名单准入,忽略 group={group_id} "
+                            f"白名单={sorted(ALLOWED_GROUPS)}")
             return
         if user_id == self.self_id or (BOT_QQ and user_id == BOT_QQ):
             if DEBUG_TRIGGER:
                 logger.info(f"[trigger] 机器人自己的消息,忽略 user={user_id}")
             return
-        # 群内成员级放行: 关闭"放行所有"后,仅名单内用户 + 管理员的消息被处理,
-        # 其余人的消息整条忽略(不进上下文/热度,也不触发)
-        if not GROUP_ALLOW_ALL_USERS and user_id not in GROUP_ALLOWED_USERS and user_id not in ADMIN_QQ:
+        # 群内成员级放行(黑白名单,模式开关 GROUP_USER_BLACKLIST_MODE;
+        # 名单项支持 群号:QQ号 定向与 all:QQ号 全局作用域): 被拒成员的
+        # 消息整条忽略(不进上下文/热度,也不触发);管理员始终放行
+        if not group_user_allowed(user_id, group_id):
             if DEBUG_TRIGGER:
-                logger.info(f"[trigger] 群成员不在放行名单,忽略 group={group_id} user={user_id}")
+                logger.info(f"[trigger] 群成员未通过成员级黑白名单,忽略 group={group_id} user={user_id}")
             return
 
         try:
@@ -1483,8 +1617,8 @@ class QQEngine:
         # 机器人永远不与自己私聊
         if user_id == self.self_id or (BOT_QQ and user_id == BOT_QQ):
             return
-        # 管理员永远允许私聊(不受白名单限制);其余人需在私聊白名单内
-        if user_id not in ADMIN_QQ and user_id not in ALLOWED_PRIVATE:
+        # 管理员永远允许私聊;其余人过私聊黑白名单准入
+        if not private_allowed(user_id):
             return
 
         try:
@@ -1557,9 +1691,9 @@ class QQEngine:
             logger.info(f"好友请求 user={user_id} comment={comment!r}: "
                         "自动通过已关闭,留待手动处理")
             return
-        if user_id not in ADMIN_QQ and user_id not in ALLOWED_PRIVATE:
+        if not private_allowed(user_id):
             logger.info(f"好友请求 user={user_id} comment={comment!r}: "
-                        "非管理员/私聊白名单,不自动通过")
+                        "未通过私聊黑白名单准入,不自动通过")
             return
         flag = str(event.get("flag") or "")
         if not flag:

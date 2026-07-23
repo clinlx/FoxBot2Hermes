@@ -52,6 +52,38 @@ def _env_set(key: str) -> set[str]:
     return {g.strip() for g in _env_str(key).split(",") if g.strip()}
 
 
+def _parse_scoped_users(raw: str, key: str = "成员名单") -> dict[str, set[str]]:
+    """成员名单解析(纯逻辑,便于单测)。
+
+    逗号分隔,单项三种写法:
+      group_id:user_id  仅在该群生效;
+      all:user_id       所有群生效;
+      user_id           等同 all:user_id。
+    返回 {"all"|群号: {QQ号, ...}};格式无效的项告警跳过。
+    """
+    out: dict[str, set[str]] = {}
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        scope, sep, uid = item.partition(":")
+        if not sep:
+            scope, uid = "all", item
+        scope, uid = scope.strip(), uid.strip()
+        if scope.lower() == "all":
+            scope = "all"
+        if not uid or (scope != "all" and not scope.isdigit()):
+            logger.warning(f"{key} 项格式无效,已忽略: {item!r}"
+                           "(应为 group_id:user_id / all:user_id / user_id)")
+            continue
+        out.setdefault(scope, set()).add(uid)
+    return out
+
+
+def _env_scoped_users(key: str) -> dict[str, set[str]]:
+    return _parse_scoped_users(_env_str(key), key)
+
+
 # ---- 数据根目录 ----
 # 所有持久化/临时文件的统一根目录;单独改某一项时可在对应变量里用
 # ${FOX_QQ_BOT_DATA_DIR} 引用本值(所有路径型变量都支持 ${VAR} 与 ~ 展开)。
@@ -79,16 +111,73 @@ NAPCAT_SEND_TIMEOUT_AS_SUCCESS = _env_bool("FOX_QQ_BOT_NAPCAT_SEND_TIMEOUT_AS_SU
 # 留空=不校验(向后兼容;但 0.0.0.0 裸监听建议务必设置,防他人冒充 NapCat 连入)。
 NAPCAT_WS_TOKEN = _env_str("FOX_QQ_BOT_NAPCAT_WS_TOKEN")
 
-# ---- 群与账号 ----
+# ---- 群与账号(黑白名单准入) ----
+# 每一级(群级/私聊级/群成员级)都有独立的模式开关,决定该级允许列表(白名单)
+# 与禁止列表(黑名单)的关系:
+#   白名单模式(false): 默认全都不能用,除非配置进白名单;黑名单大于白名单
+#                      ——两边都在的一律拒绝(在放行范围内精确踢掉个别对象);
+#   黑名单模式(true):  默认全都能用,除非配置进黑名单;白名单大于黑名单
+#                      ——两边都在的仍放行(白名单成为黑名单的豁免名单)。
 ALLOWED_GROUPS = _env_set("FOX_QQ_BOT_ALLOWED_GROUPS")
 ADMIN_QQ = _env_set("FOX_QQ_BOT_ADMIN_QQ")
 BOT_QQ = _env_str("FOX_QQ_BOT_QQ")
 ALLOWED_PRIVATE = _env_set("FOX_QQ_BOT_ALLOWED_PRIVATE")
-# 群内成员级放行(在群白名单之上再加一层): 默认放行群内所有人,
-# 关闭后仅 FOX_QQ_BOT_GROUP_ALLOWED_USERS 名单 + 管理员的消息才参与触发判定,
-# 其余人的消息只作为上下文/热度背景,不会触发机器人发言。
-GROUP_ALLOW_ALL_USERS = _env_bool("FOX_QQ_BOT_GROUP_ALLOW_ALL_GROUP_USERS", "true")
-GROUP_ALLOWED_USERS = _env_set("FOX_QQ_BOT_GROUP_ALLOWED_USERS")
+# 群级与私聊级的模式开关各自独立;FOX_QQ_BOT_BLACKLIST_MODE 是两者的共同缺省
+# (默认 false=白名单模式;想两级一起切就只设它,单独设置的级别以自己的开关为准)。
+# 管理员(ADMIN_QQ)不受私聊黑白名单限制,永远放行(防把自己锁在门外)。
+_BLACKLIST_MODE_DEFAULT = _env_str("FOX_QQ_BOT_BLACKLIST_MODE", "false")
+GROUP_BLACKLIST_MODE = _env_bool("FOX_QQ_BOT_GROUP_BLACKLIST_MODE", _BLACKLIST_MODE_DEFAULT)
+PRIVATE_BLACKLIST_MODE = _env_bool("FOX_QQ_BOT_PRIVATE_BLACKLIST_MODE", _BLACKLIST_MODE_DEFAULT)
+GROUP_BLACKLIST = _env_set("FOX_QQ_BOT_GROUP_BLACKLIST")       # 群黑名单(群号,逗号分隔)
+PRIVATE_BLACKLIST = _env_set("FOX_QQ_BOT_PRIVATE_BLACKLIST")   # 私聊黑名单(QQ 号,逗号分隔)
+# 群内成员级准入(在群级准入之上再加一层),黑白名单语义与全局一致但
+# 模式开关独立(GROUP_USER_BLACKLIST_MODE,而非 BLACKLIST_MODE),默认黑名单模式:
+#   true(默认)= 黑名单模式: 成员默认放行,除非配置进成员黑名单;
+#               此模式下白名单大于黑名单(两边都在=放行,白名单=豁免名单);
+#   false     = 白名单模式: 成员默认拒绝,仅白名单内成员 + 管理员能触发;
+#               此模式下黑名单大于白名单(两边都在=拒绝)。
+# 被拒成员的消息整条忽略(不触发/不进上下文/不计热度);管理员始终放行。
+# 旧开关 FOX_QQ_BOT_GROUP_ALLOW_ALL_GROUP_USERS 仍兼容(新变量未设时生效:
+# true=黑名单模式,false=白名单模式)。
+GROUP_USER_BLACKLIST_MODE = _env_bool(
+    "FOX_QQ_BOT_GROUP_USER_BLACKLIST_MODE",
+    _env_str("FOX_QQ_BOT_GROUP_ALLOW_ALL_GROUP_USERS", "true"))
+# 成员名单项格式(逗号分隔): group_id:user_id=仅该群生效;
+# all:user_id 或裸 user_id=所有群生效。解析为 {"all"|群号: {QQ号,...}}。
+GROUP_ALLOWED_USERS = _env_scoped_users("FOX_QQ_BOT_GROUP_ALLOWED_USERS")
+GROUP_USER_BLACKLIST = _env_scoped_users("FOX_QQ_BOT_GROUP_USER_BLACKLIST")
+
+
+def group_allowed(group_id: str) -> bool:
+    """群级准入统一判定(engine 入站/tools 出站/cron 校验/管理命令共用)。"""
+    if GROUP_BLACKLIST_MODE:
+        return group_id in ALLOWED_GROUPS or group_id not in GROUP_BLACKLIST
+    return group_id in ALLOWED_GROUPS and group_id not in GROUP_BLACKLIST
+
+
+def private_allowed(user_id: str) -> bool:
+    """私聊准入统一判定;管理员永远放行(否则收得到消息却回不了)。"""
+    if user_id in ADMIN_QQ:
+        return True
+    if PRIVATE_BLACKLIST_MODE:
+        return user_id in ALLOWED_PRIVATE or user_id not in PRIVATE_BLACKLIST
+    return user_id in ALLOWED_PRIVATE and user_id not in PRIVATE_BLACKLIST
+
+
+def _scoped_has(users: dict[str, set[str]], group_id: str, user_id: str) -> bool:
+    """成员名单命中: all 作用域 ∪ 当前群作用域。"""
+    return user_id in users.get("all", ()) or user_id in users.get(group_id, ())
+
+
+def group_user_allowed(user_id: str, group_id: str) -> bool:
+    """群成员级准入统一判定;模式开关 GROUP_USER_BLACKLIST_MODE,管理员永远放行。"""
+    if user_id in ADMIN_QQ:
+        return True
+    in_allow = _scoped_has(GROUP_ALLOWED_USERS, group_id, user_id)
+    in_deny = _scoped_has(GROUP_USER_BLACKLIST, group_id, user_id)
+    if GROUP_USER_BLACKLIST_MODE:
+        return in_allow or not in_deny
+    return in_allow and not in_deny
 # 机器人名字/别名(逗号分隔,大小写不敏感): 真实 at 段之外,
 # 纯文本 "@别名" 也视为 @机器人。留空 = 只认真实 at 段
 BOT_NAMES = [n.strip() for n in _env_str("FOX_QQ_BOT_NAMES").split(",") if n.strip()]
@@ -169,7 +258,7 @@ DEFAULT_GROUP_PROMPT = (
     "{{INJECT}}\n"
     "[当前时间] {{TIME}}\n"
     "[当前场景] QQ私聊 ; 群号 {{GROUP_ID}} ; 群名: {{GROUP_NICKNAME}}\n"
-    "保持你一贯的性格和说话方式。发言用 fox_qq_send_message 工具发出(可多条);"
+    "保持你一贯的性格和说话方式。发言用 fox_qq_send_message 工具发出,推荐像真人一样把话切成几条口语化短句放进 content 数组(会以自然节奏逐条发出);"
     "消息前缀 [msg_id#数字][昵称(qq_id@QQ号)] 中,msg_id 是消息 ID,qq_id 是发送者 QQ 号;"
     "引用某条就把 [#reply@消息ID] 放在 content 最开头;@人用 qq_id 而非 msg_id;"
     "不必开口时回复单独一行 [NO_REPLY] 结束。QQ 不渲染 Markdown,用纯文本"
@@ -178,7 +267,7 @@ DEFAULT_PRIVATE_PROMPT = (
     "{{INJECT}}\n"
     "[当前时间] {{TIME}}\n"
     "[当前场景] QQ私聊 ; 对方QQ号 {{USER_ID}} ; 昵称: {{USER_NICKNAME}}\n"
-    "保持你一贯的性格和说话方式。发言用 fox_qq_send_message 工具发出(可多条);"
+    "保持你一贯的性格和说话方式。发言用 fox_qq_send_message 工具发出,推荐像真人一样把话切成几条口语化短句放进 content 数组(会以自然节奏逐条发出);"
     "不必回应时回复单独一行 [NO_REPLY] 结束。QQ 不渲染 Markdown,用纯文本;"
 )
 DEFAULT_PROACTIVE_PROMPT = (
@@ -210,7 +299,8 @@ DEFAULT_CRON_PROMPT = (
     "</CronTask>\n"
     "请执行该任务\n"
     "\n"
-    "* 发言尽量通过 fox_qq_send_message 工具发出(引用/@人/表情/分段只有工具能控制);"
+    "* 发言尽量通过 fox_qq_send_message 工具发出,推荐把话切成几条口语化短句放进"
+    " content 数组(引用/@人/表情/分段只有工具能控制);"
     "若没什么值得说的,直接不使用工具回复 [NO_REPLY] 来结束;"
 )
 
@@ -233,7 +323,8 @@ DEFAULT_FRIEND_PROMPT = (
     "</Comment>\n"
     "请用 fox_qq_send_message 工具主动打个招呼:自然一点,"
     "像刚加上好友那样,一两句即可,可以顺着验证消息接话;\n"
-    "* 发言尽量通过 fox_qq_send_message 工具发出(引用/@人/表情/分段只有工具能控制);"
+    "* 发言尽量通过 fox_qq_send_message 工具发出,推荐把话切成几条口语化短句放进"
+    " content 数组(引用/@人/表情/分段只有工具能控制);"
     "发完后回复单行 [NO_REPLY] 结束;"
 )
 
@@ -544,6 +635,19 @@ def hermes_backend_is_container() -> bool | None:
 IMAGE_URL_AS_IMAGE = _env_bool("FOX_QQ_BOT_IMAGE_URL_AS_IMAGE", "true")
 MAX_SEGMENT_LEN = _env_int("FOX_QQ_BOT_MAX_SEGMENT_LEN", 1800)
 MAX_SEGMENTS = _env_int("FOX_QQ_BOT_MAX_SEGMENTS", 3)
+
+# ---- 出站发送队列(拟人节奏) ----
+# fox_qq_send_message 的 content 支持字符串数组: 多条短句一次性提交,
+# 进入按会话隔离的待发送队列后工具瞬间返回(不拖累 Agent 回合进度)。
+# 后台发送循环第一条秒发,后续每条间隔 SEND_INTERVAL + rand(0, SEND_JITTER) 秒,
+# 模拟真人逐句打字的节奏。
+SEND_INTERVAL = _env_float("FOX_QQ_BOT_SEND_INTERVAL", 1.0)   # 连发基础间隔(秒)
+SEND_JITTER = _env_float("FOX_QQ_BOT_SEND_JITTER", 2.0)       # 连发随机抖动(秒)
+# 唤醒前等待发送队列清空的上限(秒): 队列有剩余时新回合先等它发完再取上下文,
+# 保证 AI 看到自己完整的发送历史;超时则放行(宁可上下文缺几条,不能卡死回合)
+SEND_DRAIN_TIMEOUT = _env_float("FOX_QQ_BOT_SEND_DRAIN_TIMEOUT", 90)
+# 单次调用最多入队的内容条数(超出截断并在返回中提醒),防止 AI 一口气塞爆队列
+SEND_QUEUE_MAX = max(1, _env_int("FOX_QQ_BOT_SEND_QUEUE_MAX", 10))
 
 # ---- 表情系统 ----
 # 表情图片目录: 开发时用 ./emoticons/,部署时建议放 fox_bot_data/emoticons/。
